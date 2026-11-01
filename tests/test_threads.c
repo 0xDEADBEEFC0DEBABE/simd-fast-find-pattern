@@ -11,8 +11,10 @@
 #include <pthread.h>
 #endif
 
-enum { THREAD_COUNT = 8, ITERATIONS = 2000 };
-static fp_pattern *shared_pattern;
+enum { THREAD_COUNT = 8, ITERATIONS = 2000, DATA_SIZE = 4099, PLANTED = 3001, SIG_COUNT = 4 };
+static fp_set *shared_set;
+static const char *const texts[SIG_COUNT] = {"F4 A7 C2 91", "F4 A? ?? 91", "C2 91 10", "AB CD EF"};
+static const size_t expected[SIG_COUNT] = {PLANTED, PLANTED, PLANTED + 2, SIZE_MAX};
 
 typedef struct {
     unsigned index;
@@ -30,17 +32,35 @@ static unsigned ready_count;
 static int started;
 #endif
 
+static int scan_matches(const uint8_t *data, const fp_set *set, size_t *offsets)
+{
+    unsigned i;
+    if (fp_scan(data, DATA_SIZE, set, offsets) != PLANTED) {
+        return 0;
+    }
+    for (i = 0; i < SIG_COUNT; ++i) {
+        if (offsets[i] != expected[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void run_worker(thread_context *context)
 {
-    uint8_t data[257];
+    static uint8_t buffers[THREAD_COUNT][DATA_SIZE];
+    uint8_t *data = buffers[context->index];
     const uint8_t pattern[] = {0xf4, 0xa7, 0xc2, 0x91};
     const uint8_t mask[] = {0xff, 0xf0, 0, 0xff};
+    const fp_sig exact = {pattern, NULL, sizeof(pattern)};
+    const fp_sig masked = {pattern, mask, sizeof(pattern)};
+    size_t offsets[SIG_COUNT];
     const char *cpu_info;
     char initial_cpu_info[512];
-    fp_pattern *compiled;
+    fp_set *set, *single;
     unsigned iteration;
-    memset(data, 0x10, sizeof(data));
-    memcpy(data + 127, pattern, sizeof(pattern));
+    memset(data, 0x10, DATA_SIZE);
+    memcpy(data + PLANTED, pattern, sizeof(pattern));
 #if defined(_WIN32)
     if (InterlockedIncrement(&ready_count) == THREAD_COUNT) {
         SetEvent(ready_event);
@@ -64,9 +84,11 @@ static void run_worker(thread_context *context)
     /* This executable intentionally makes no library calls before this point,
      * so metadata and search callers race to initialize dispatch. */
     if (context->index % 2) {
-        if (fp_find(data, sizeof(data), pattern, sizeof(pattern), NULL) != 127) {
+        fp_set *first = fp_set_from_bytes(&exact, 1, NULL);
+        if (!first || fp_scan(data, DATA_SIZE, first, NULL) != PLANTED) {
             ++context->failures;
         }
+        fp_set_free(first);
     }
     cpu_info = fp_cpuinfo();
     if (!cpu_info || !cpu_info[0] || strlen(cpu_info) >= sizeof(initial_cpu_info)) {
@@ -74,24 +96,23 @@ static void run_worker(thread_context *context)
         return;
     }
     strcpy(initial_cpu_info, cpu_info);
-    compiled = shared_pattern ? shared_pattern : fp_compile("F4 A? ?? 91");
-    if (!compiled) {
+    set = shared_set ? shared_set : fp_set_from_text(texts, SIG_COUNT, NULL);
+    single = fp_set_from_bytes(&masked, 1, NULL);
+    if (!set || !single) {
         ++context->failures;
-        return;
     }
-    for (iteration = 0; iteration < ITERATIONS; ++iteration) {
-        if (fp_find(data, sizeof(data), pattern, sizeof(pattern), NULL) != 127 ||
-            fp_find(data, sizeof(data), pattern, sizeof(pattern), mask) != 127 ||
-            fp_find_pattern(data, sizeof(data), "F4 A? ?? 91") != 127 ||
-            fp_find_compiled(data, sizeof(data), compiled) != 127 ||
+    for (iteration = 0; set && single && iteration < ITERATIONS; ++iteration) {
+        if (!scan_matches(data, set, offsets) || fp_scan(data, DATA_SIZE, single, NULL) != PLANTED ||
+            fp_scan(data, DATA_SIZE, set, NULL) != PLANTED ||
             strcmp(initial_cpu_info, fp_cpuinfo()) != 0 || !fp_ver() || !fp_ver()[0]) {
             ++context->failures;
             break;
         }
     }
-    if (!shared_pattern) {
-        fp_free(compiled);
+    if (!shared_set) {
+        fp_set_free(set);
     }
+    fp_set_free(single);
 }
 
 #if defined(_WIN32)
@@ -113,9 +134,9 @@ int main(int argc, char **argv)
     thread_context contexts[THREAD_COUNT];
     unsigned i;
     if (argc == 2 && strcmp(argv[1], "--shared-compiled") == 0) {
-        shared_pattern = fp_compile("F4 A? ?? 91");
-        if (!shared_pattern) {
-            fputs("Shared pattern compilation failed\n", stderr);
+        shared_set = fp_set_from_text(texts, SIG_COUNT, NULL);
+        if (!shared_set) {
+            fputs("Shared set compilation failed\n", stderr);
             return EXIT_FAILURE;
         }
     } else if (argc != 1) {
@@ -183,8 +204,8 @@ int main(int argc, char **argv)
         }
     }
     printf("Passed %s concurrency test (%u threads, %u iterations each)\n",
-           shared_pattern ? "shared compiled-pattern" : "cold-start",
+           shared_set ? "shared set" : "cold-start",
            (unsigned)THREAD_COUNT, (unsigned)ITERATIONS);
-    fp_free(shared_pattern);
+    fp_set_free(shared_set);
     return EXIT_SUCCESS;
 }

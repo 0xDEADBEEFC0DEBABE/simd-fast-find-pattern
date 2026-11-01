@@ -28,6 +28,15 @@ jobs:
             os: macos-14
             cc: clang
             cxx: clang++
+          - name: Linux GCC (ARM64)
+            os: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+          - name: Windows MSVC (ARM64)
+            os: windows-11-arm
+            cc: cl
+            cxx: cl
+            cmake_args: -A ARM64
           - name: Windows MSVC
             os: windows-latest
             cc: cl
