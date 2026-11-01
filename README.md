@@ -184,6 +184,21 @@ For a found signature, throughput counts only `offset + signature_length` bytes;
 
 These are warm-cache microbenchmarks, not application-level measurements. Record the compiler/version, flags, CPU, backend, buffer size, and power settings when sharing results. Run both normal and scalar builds on the target machine; do not infer x86 SIMD speed from an ARM or emulated run. No universal speedup is claimed.
 
+## Compared with 0x80.pl
+
+FastPattern was measured against Wojciech Muła's SIMD substring search ([0x80.pl](http://0x80.pl/articles/simd-strfind.html): `sse2_strstr_v2`, `avx2_strstr_v2` and `avx512bw_strstr_v2` from [sse4-strstr](https://github.com/WojciechMula/sse4-strstr), compiled unmodified) on a real x86-64 Windows binary: 149 signatures searched in its 24.6 MB code section. The binary and the signatures are not published. Those searches take exact needles, so each signature's wildcards were filled in with the bytes where it matches, which gives needles of 6 to 1,777 bytes (median 24) that each occur once. FastPattern was built with `FP_MAX_SIMD_BITS` at 128, 256 and 512, each against the search of the same width, and searched each needle as a set of one, or all 149 as one set: `fp_scan` for first matches, `fp_scan_counts` counting to 2 for the unique check. The unique check searches past each first match, which must find nothing, as a loader that rejects ambiguous signatures does. Every result was compared with a naive search before timing. Times are for all 149 needles, warm, on one pinned core of a Ryzen 9 7950X (Windows, Clang 22, `-O3`): the median over three runs of each run's best of 15. Parentheses give 0x80.pl's time over FastPattern's.
+
+| Width | All 149 needles | 0x80.pl, each needle | FastPattern, each needle | FastPattern, one set |
+| --- | --- | ---: | ---: | ---: |
+| 128-bit | first matches | 67.51 ms | 47.97 ms (1.41x) | 10.90 ms (6.19x) |
+| | unique check | 129.57 ms | 93.00 ms (1.39x) | 11.58 ms (11.19x) |
+| 256-bit | first matches | 43.63 ms | 28.67 ms (1.52x) | 5.93 ms (7.36x) |
+| | unique check | 88.93 ms | 57.34 ms (1.55x) | 6.46 ms (13.77x) |
+| 512-bit | first matches | 41.54 ms | 31.03 ms (1.34x) | 5.53 ms (7.51x) |
+| | unique check | 85.11 ms | 61.02 ms (1.39x) | 6.03 ms (14.11x) |
+
+Between runs, the per-needle ratios moved by at most 0.11 and the one-set ratios by at most 0.4. FastPattern's 128-bit build reports SSSE3, which its set scans use; 0x80.pl's 128-bit search is SSE2. With the original wildcard signatures, which those searches cannot take, FastPattern finds all first matches in one set in 8.71 ms and counts the matches to 2 in 10.24 ms. These figures, too, depend on the CPU, the data, and the signatures.
+
 ## Scope
 
 FastPattern performs unanchored, fixed-length, case-sensitive byte matching. Its `?` wildcard consumes exactly one byte. It does not implement variable-length `*` globs, Unicode case folding, whole-string matching, linked-list traversal, indexes, or streaming state across chunks. For chunked input, callers must preserve up to `signature_length - 1` bytes between chunks to detect boundary-spanning matches.
