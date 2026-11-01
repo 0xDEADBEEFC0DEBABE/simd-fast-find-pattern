@@ -109,12 +109,12 @@ For example, `46 50 ? ?? A? ?F` contains six bytes. Empty strings and malformed 
 | --- | --- |
 | x86 with GCC or Clang | Scalar, SSE2, AVX2, AVX-512BW; selected using runtime CPU/OS support |
 | x86 with MSVC | Baseline SSE2 where available, otherwise scalar |
-| AArch64 with GCC or Clang | NEON and scalar |
-| Other compiler/architecture combinations (including MSVC ARM64), or `FP_DISABLE_SIMD` | Portable scalar implementation |
+| AArch64 with GCC, Clang, or MSVC | NEON and scalar |
+| Other compiler/architecture combinations, or `FP_DISABLE_SIMD` | Portable scalar implementation |
 
 The backend description reports the strongest available and enabled implementation; searches can select narrower SIMD or scalar code when the number of candidate offsets is small. For diagnostic comparisons, GCC/Clang x86 builds can set `-DFP_MAX_SIMD_BITS=128` or `=256` to cap SIMD width while preserving runtime checks.
 
-SIMD paths filter multiple candidate offsets before verifying a complete match, including multi-byte patterns and masks. Vector loads stay within the supplied buffer, and a scalar tail handles the remainder. ISA selection does not guarantee the lowest latency for every CPU or workload: pattern length, wildcard distribution, input contents, match position, cache state, and processor frequency all matter. AVX-512 availability alone does not guarantee a speedup over AVX2. Repetitive data and weakly selective masks can require many candidate verifications; worst-case work can grow with both buffer and pattern length.
+SIMD paths filter multiple candidate offsets before verifying a complete match, including multi-byte patterns and masks. The filter tests two anchor bytes: the first constrained byte and the last one, or, when both are the same exact byte, the last exact byte that differs from it, so runs of a repeated byte such as zero or `0xcc` padding do not make every offset a candidate. On x86, blocks with several candidates are narrowed one pattern byte at a time across all lanes before individual verification. Vector loads stay within the supplied buffer: the final vector ends at the last possible match and overlaps offsets already scanned, and AVX-512 short searches use masked loads. ISA selection does not guarantee the lowest latency for every CPU or workload: pattern length, wildcard distribution, input contents, match position, cache state, and processor frequency all matter. AVX-512 availability alone does not guarantee a speedup over AVX2. Repetitive data and weakly selective masks can require many candidate verifications; worst-case work can grow with both buffer and pattern length.
 
 ## Reproducible benchmarks
 

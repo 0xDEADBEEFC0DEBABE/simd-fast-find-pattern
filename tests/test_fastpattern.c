@@ -232,24 +232,104 @@ static void test_boundaries(void)
     CHECK_EQ(fp_find(storage, sizeof(storage), pattern, 17, NULL), 511);
 }
 
-static void test_random(void)
+static void test_dense_candidates(void)
 {
-    uint8_t storage[1024 + 64];
+    /* Both anchors match at every offset, so each vector block (including an
+     * overlapping final block) holds many failing candidates before the hit. */
+    static const size_t sizes[] = {
+        3, 15, 16, 17, 18, 19, 20, 31, 32, 33, 34, 47, 48, 49, 63, 64, 65, 66,
+        79, 95, 96, 97, 98, 127, 128, 129, 130, 255, 256, 257
+    };
+    static const size_t pattern_sizes[] = {3, 4, 9, 16, 17, 33};
+    uint8_t data[257];
+    uint8_t pattern[33];
+    uint8_t mask[33];
+    size_t a, b, location;
+    for (a = 0; a < sizeof(sizes) / sizeof(sizes[0]); ++a) {
+        const size_t n = sizes[a];
+        for (b = 0; b < sizeof(pattern_sizes) / sizeof(pattern_sizes[0]); ++b) {
+            const size_t m = pattern_sizes[b];
+            if (m > n) {
+                continue;
+            }
+            memset(pattern, 0xa5, m);
+            pattern[m / 2] = 0x5a;
+            memset(mask, 0xff, m);
+            mask[0] = 0xf0;
+            mask[m - 1] = 0x0f;
+            memset(data, 0xa5, n);
+            CHECK_EQ(fp_find(data, n, pattern, m, NULL), SIZE_MAX);
+            CHECK_EQ(fp_find(data, n, pattern, m, mask), SIZE_MAX);
+            for (location = 0; location <= n - m; ++location) {
+                memset(data, 0xa5, n);
+                data[location + m / 2] = 0x5a;
+                CHECK_EQ(fp_find(data, n, pattern, m, NULL), location);
+                CHECK_EQ(fp_find(data, n, pattern, m, mask), location);
+            }
+        }
+    }
+}
+
+static void test_long_exact(void)
+{
+    /* Long enough for the planned exact scan: early matches, unrolled blocks,
+     * dense blocks narrowed byte by byte, and the final block. In the flood,
+     * equal first and last pattern bytes match every data byte, so the second
+     * anchor moves to the differing byte; in the alternating data, distinct
+     * anchors pass at every even offset. Only the planted copy holds 0x33. */
+    static const size_t sizes[] = {1100, 1151, 1152, 1153, 2047, 2048, 2049, 4111};
+    static const size_t pattern_sizes[] = {2, 3, 4, 8, 12, 16, 17, 33, 64, 65};
+    static uint8_t data[4111];
+    uint8_t pattern[65];
+    size_t a, b, kind, j, l;
+    for (a = 0; a < sizeof(sizes) / sizeof(sizes[0]); ++a) {
+        const size_t n = sizes[a];
+        for (b = 0; b < sizeof(pattern_sizes) / sizeof(pattern_sizes[0]); ++b) {
+            const size_t m = pattern_sizes[b];
+            const size_t locations[] = {
+                0, 1, 31, 32, 63, 64, 65, 127, 128, 129, n / 2, n - m - 64, n - m - 1, n - m
+            };
+            for (kind = 0; kind < 2; ++kind) {
+                for (j = 0; j < m; ++j) {
+                    pattern[j] = (uint8_t)(kind && j % 2 ? 0x5a : 0xa5);
+                }
+                pattern[m / 2] = 0x33;
+                for (l = 0; l < sizeof(locations) / sizeof(locations[0]); ++l) {
+                    for (j = 0; j < n; ++j) {
+                        data[j] = (uint8_t)(kind && j % 2 ? 0x5a : 0xa5);
+                    }
+                    if (l == 0) {
+                        CHECK_EQ(fp_find(data, n, pattern, m, NULL), SIZE_MAX);
+                    }
+                    memcpy(data + locations[l], pattern, m);
+                    CHECK_EQ(fp_find(data, n, pattern, m, NULL), locations[l]);
+                }
+            }
+        }
+    }
+}
+
+/* Random patterns, masks, and buffers of up to max_size bytes; a nonzero
+ * alphabet draws data and pattern bytes from that many values, giving dense
+ * candidates and repeated matches. */
+static void test_random_sizes(size_t iterations, size_t max_size, unsigned alphabet)
+{
+    static uint8_t storage[8192 + 64];
     uint8_t pattern[193];
     uint8_t mask[193];
     size_t iteration;
-    for (iteration = 0; iteration < 20000; ++iteration) {
-        const size_t n = next_random() % 1025;
+    for (iteration = 0; iteration < iterations; ++iteration) {
+        const size_t n = next_random() % (max_size + 1);
         const size_t m = next_random() % 194;
         uint8_t *data = storage + next_random() % 64;
         const unsigned mode = next_random() % 6;
         const uint8_t *selected_mask = mode == 0 ? NULL : mask;
         size_t j;
         for (j = 0; j < n; ++j) {
-            data[j] = (uint8_t)next_random();
+            data[j] = (uint8_t)(alphabet ? next_random() % alphabet : next_random());
         }
         for (j = 0; j < m; ++j) {
-            pattern[j] = (uint8_t)next_random();
+            pattern[j] = (uint8_t)(alphabet ? next_random() % alphabet : next_random());
             switch (mode) {
             case 1: mask[j] = 0xff; break;
             case 2: mask[j] = next_random() % 2 ? 0xff : 0; break;
@@ -269,6 +349,14 @@ static void test_random(void)
         CHECK_EQ(fp_find(data, n, pattern, m, selected_mask),
                  reference_find(data, n, pattern, m, selected_mask));
     }
+}
+
+static void test_random(void)
+{
+    test_random_sizes(20000, 1024, 0);
+    test_random_sizes(3000, 8192, 0);
+    test_random_sizes(3000, 8192, 3);
+    test_random_sizes(5000, 1024, 2);
 }
 
 static void test_random_parser(void)
@@ -358,14 +446,15 @@ static void free_guarded_page(guarded_page region)
 
 static void test_guard_pages(void)
 {
-    static const size_t sizes[] = {1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257};
+    static const size_t sizes[] = {1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+                                   1100, 2049, 4096};
     guarded_page data_region = allocate_guarded_page();
     guarded_page pattern_region = allocate_guarded_page();
     guarded_page mask_region = allocate_guarded_page();
     size_t a, b;
     unsigned edge;
     for (edge = 0; edge < 2; ++edge) {
-        for (a = 0; a < sizeof(sizes) / sizeof(sizes[0]); ++a) {
+        for (a = 0; a < sizeof(sizes) / sizeof(sizes[0]) && sizes[a] <= data_region.page_size; ++a) {
             const size_t n = sizes[a];
             uint8_t *data = data_region.page + (edge ? data_region.page_size - n : 0);
             for (b = 0; b <= a; ++b) {
@@ -416,6 +505,8 @@ int main(void)
     test_parser();
     test_compiled_ownership();
     test_boundaries();
+    test_dense_candidates();
+    test_long_exact();
     test_random();
     test_random_parser();
     test_guard_pages();
