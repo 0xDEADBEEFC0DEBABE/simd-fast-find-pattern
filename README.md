@@ -66,6 +66,14 @@ if (set == NULL) {
 }
 ```
 
+To require that each signature occur only once, as loaders that reject ambiguous signatures do, count matches in the same single scan. With a limit of 2, the scan stops looking for a signature at its second match:
+
+```c
+size_t counts[3];
+fp_scan_counts(data, sizeof(data), set, offsets, counts, 2);
+/* counts[i] == 1: signature i is unique, at offsets[i]; 2: it repeats; 0: absent. */
+```
+
 Signatures can also be given as bytes and masks, which is how to express masks that are not whole nibbles:
 
 ```c
@@ -86,6 +94,7 @@ All declarations are in `fastpattern.h`, with C++ linkage guards.
 | `fp_set_from_text(sigs, count, error)` | Parse `count` text signatures into a new set, or return `NULL` and describe the failure in `*error` (which may be `NULL`). |
 | `fp_set_from_bytes(sigs, count, error)` | The same for `fp_sig` signatures: bytes, a mask or `NULL` for exact bytes, and a length. |
 | `fp_scan(data, size, set, offsets)` | Search `data` once for every signature. Returns the lowest offset at which any signature matches, or `SIZE_MAX`. If `offsets` is not `NULL`, `offsets[i]` receives the first offset of signature `i`, or `SIZE_MAX`. |
+| `fp_scan_counts(data, size, set, offsets, counts, limit)` | `fp_scan`, also counting: `counts[i]` receives the number of offsets at which signature `i` matches, overlapping matches included, up to `limit` (`0` for no limit), where the scan stops looking for it. |
 | `fp_set_count(set)` | The number of signatures, `0` for `NULL`. |
 | `fp_set_free(set)` | Release a set; `NULL` is accepted. |
 | `fp_ver()` | Return the library version string. |
@@ -93,7 +102,7 @@ All declarations are in `fastpattern.h`, with C++ linkage guards.
 
 Construction fails with `FP_ERROR_ARGUMENT` for a `NULL` list or signature pointer or a count of zero, `FP_ERROR_EMPTY` for a signature without bytes, `FP_ERROR_SYNTAX` for malformed text, and `FP_ERROR_MEMORY` when allocation fails or the set would be too large. `fp_error.index` names the signature and, for syntax errors, `fp_error.position` is the offset of the bad token in its text. On success, `error->status` is `FP_OK`.
 
-`fp_scan` with a `NULL` set returns `SIZE_MAX` and writes nothing; `NULL` data holds no matches. Signatures longer than the buffer do not match, and an all-wildcard signature matches at zero when the buffer is large enough. Scans read only `data[0, size)`; they do not inspect other process memory or join separate buffers. Buffers need no alignment, terminator, or padding.
+`fp_scan` with a `NULL` set returns `SIZE_MAX` and writes nothing; `NULL` data holds no matches. `fp_scan_counts` behaves the same, and with `NULL` counts it is `fp_scan`. Signatures longer than the buffer do not match, and an all-wildcard signature matches at zero when the buffer is large enough. Scans read only `data[0, size)`; they do not inspect other process memory or join separate buffers. Buffers need no alignment, terminator, or padding.
 
 For byte signatures, each byte matches when:
 
@@ -122,12 +131,12 @@ On x86 with SSSE3 or better, sets of five or more signatures are searched with T
 
 - Each signature gets a fingerprint: the 4 consecutive bytes least likely to occur in x86-64 code, judged by byte frequencies measured on the executable sections of Windows system binaries. `PSHUFB` looks up both nibbles of every data byte in per-group tables, so wildcards and nibble masks cost nothing.
 - Fingerprints share 8 buckets per group. Signatures are sorted so that similar fingerprints meet, and each joins the bucket whose estimated false-candidate rate it raises least; a group closes when its budget is spent, so groups of rare fingerprints hold more signatures than groups of common ones.
-- With `offsets`, a bucket leaves the scan once its signatures are found, and the scan ends when all are. Without, it stops where no signature could start below the lowest match found.
+- With `offsets`, a bucket leaves the scan once its signatures are found, and the scan ends when all are; when counting, once they reach the limit. Without either, it stops where no signature could start below the lowest match found.
 - Where candidates grow dense, as in long runs of padding, a group gives way to searching its remaining signatures one by one, from where it stopped. Signatures too short for a fingerprint, or without an informative one, are always searched one by one.
 
 Smaller sets, buffers under 67 bytes, and other backends (SSE2 without SSSE3, NEON, scalar) search each signature in turn with the single-signature code. A set's result never depends on the path taken.
 
-On a Ryzen 9 7950X (AVX-512BW, Windows, Clang 22), one scan of 66 MB of code from Windows system DLLs, with signatures of 10 to 20 bytes copied from it, took 3.5 ms for 16 signatures and 64 ms for 256, against 14.5 ms and 271 ms for one scan per signature (4.1x and 4.2x); across runs, as the machine's state moved both timings, the gain ranged from 3.3x to 4.3x. On the benchmark's random data the gain for 256 signatures is about 4x; with 4 signatures or fewer a set is no faster. Dense candidate data can make a set slightly slower than separate scans. These figures depend on the CPU, the data, and the signatures; measure your own workload.
+On a Ryzen 9 7950X (AVX-512BW, Windows, Clang 22), one scan of 66 MB of code from Windows system DLLs, with signatures of 10 to 20 bytes copied from it, took 3.5 ms for 16 signatures and 64 ms for 256, against 14.5 ms and 271 ms for one scan per signature (4.1x and 4.2x); across runs, as the machine's state moved both timings, the gain ranged from 3.3x to 4.3x. On the benchmark's random data the gain for 256 signatures is about 4x; with 4 signatures or fewer a set is no faster. Dense candidate data can make a set slightly slower than separate scans. Counting keeps each signature in the scan until it reaches the limit, so a uniqueness check with a limit of 2 makes a full pass for every group: on the benchmark's random data it costs about as much as a scan with offsets, and twice as much as a scan for the lowest offset alone. These figures depend on the CPU, the data, and the signatures; measure your own workload.
 
 ## Runtime dispatch and portability
 
@@ -167,7 +176,7 @@ cc -O3 -std=c11 benchmark.c fastpattern.c -o fp_benchmark
 ./fp_benchmark 16    # change large-buffer size to 16 MiB (range: 1..256)
 ```
 
-The first part covers random and repetitive large buffers, exact and masked 8-byte signatures, beginning/end/missing matches, and all-wildcard signatures, through `fp_scan`'s return value (`scan`), with `offsets` (`offsets`), and with the set built and freed on every call (`build+scan`). The second part times sets of 2 to 256 signatures copied from random data, every fourth byte a wildcard, once per signature (`singles`), as one set with offsets (`set`), and for the lowest offset only (`set-first`). Each fixture has a known expected result. Every result is checked against an independent scalar reference **before that fixture is timed**; mismatches fail the run.
+The first part covers random and repetitive large buffers, exact and masked 8-byte signatures, beginning/end/missing matches, and all-wildcard signatures, through `fp_scan`'s return value (`scan`), with `offsets` (`offsets`), and with the set built and freed on every call (`build+scan`). The second part times sets of 2 to 256 signatures copied from random data, every fourth byte a wildcard, once per signature (`singles`), as one set with offsets (`set`), for the lowest offset only (`set-first`), and as one set counting each signature's matches to 2 (`set-counts`). Each fixture has a known expected result. Every result is checked against an independent scalar reference **before that fixture is timed**; mismatches fail the run.
 
 The report prints the selected backend, nanoseconds per call, iterations per batch, and logical search throughput. Each result is the median of three warm-cache batches after calibration to at least 10 ms per batch, subject to a fixed iteration cap. The deterministic random generator starts from seed `0x4d595df4` for each fixture. Timing includes a volatile indirect function call, which is significant for very short searches. The reference is deliberately simple, not a claim about the best possible scalar algorithm.
 

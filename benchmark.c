@@ -31,6 +31,7 @@ struct bench_case {
     size_t count;
     fp_set *singles[MAX_SIGS];
     size_t offsets[MAX_SIGS];
+    size_t counts[MAX_SIGS];
 };
 
 typedef size_t (*search_function)(struct bench_case *);
@@ -91,6 +92,12 @@ static size_t build_search(struct bench_case *c)
     const size_t result = fp_scan(c->data, c->size, set, NULL);
     fp_set_free(set);
     return result;
+}
+
+/* Every signature's matches counted to 2, which tells unique ones. */
+static size_t counts_search(struct bench_case *c)
+{
+    return fp_scan_counts(c->data, c->size, c->set, c->offsets, c->counts, 2);
 }
 
 /* Each signature on its own, collecting the lowest offset. */
@@ -316,6 +323,20 @@ static int run_set_case(uint8_t *data, size_t size, size_t count, int miss)
             return 0;
         }
     }
+    /* A count of 2 needs a second match, which a search past the first finds. */
+    if (counts_search(&c) != lowest) {
+        fprintf(stderr, "Correctness failure: counting a %zu-signature set\n", count);
+        return 0;
+    }
+    for (i = 0; i < count; ++i) {
+        const size_t second = expected[i] == SIZE_MAX ? SIZE_MAX
+            : fp_scan(data + expected[i] + 1, size - expected[i] - 1, c.singles[i], NULL);
+        if (c.offsets[i] != expected[i] ||
+            c.counts[i] != (size_t)(expected[i] != SIZE_MAX) + (size_t)(second != SIZE_MAX)) {
+            fprintf(stderr, "Correctness failure: count of signature %zu of %zu\n", i, count);
+            return 0;
+        }
+    }
     (void)snprintf(label, sizeof(label), "%zu sigs", count);
     (void)snprintf(result, sizeof(result), "%zu/%zu", found, count);
     seconds = median_latency(singles_search, &c, &iterations);
@@ -325,6 +346,8 @@ static int run_set_case(uint8_t *data, size_t size, size_t count, int miss)
     seconds = median_latency(scan_search, &c, &iterations);
     print_row("random", label, miss ? "miss" : "found", size, lowest == SIZE_MAX ? "miss" : "first",
               "set-first", seconds, iterations, lowest == SIZE_MAX ? size : lowest + 16);
+    seconds = median_latency(counts_search, &c, &iterations);
+    print_row("random", label, miss ? "miss" : "found", size, result, "set-counts", seconds, iterations, size);
     fp_set_free(c.set);
     for (i = 0; i < count; ++i) fp_set_free(c.singles[i]);
     return 1;
@@ -379,7 +402,8 @@ int main(int argc, char **argv)
     }
     printf("\nSignature sets: copies of random data from its second half, every fourth byte a\n");
     printf("wildcard. singles scans with a set of one per signature, set scans once for all\n");
-    printf("offsets, set-first only for the lowest. GiB/s counts the buffer once per call.\n\n");
+    printf("offsets, set-first only for the lowest, and set-counts also counts each signature's\n");
+    printf("matches to 2, telling unique ones. GiB/s counts the buffer once per call.\n\n");
     for (miss = 0; miss < 2; ++miss) {
         for (i = 0; i < sizeof(set_counts) / sizeof(set_counts[0]); ++i) {
             if (!run_set_case(data, large_size, set_counts[i], miss)) {

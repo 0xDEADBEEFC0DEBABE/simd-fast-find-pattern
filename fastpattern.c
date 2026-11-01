@@ -1416,23 +1416,71 @@ fp_set* fp_set_from_text(const char* const* sigs, size_t count, fp_error* error)
     return fp_set_finish(set, error);
 }
 
+/* What a scan reports besides the lowest offset, which is all it finds
+ * without one: with offsets, each signature's first match, and with counts,
+ * its matches up to limit. A signature is done once it has its first match,
+ * or with counts, limit of them. */
+typedef struct {
+    size_t* offsets;
+    size_t* counts;
+    size_t limit;
+} fp_report;
+
+FP_INLINE int fp_done(const fp_report* report, size_t sig) {
+    return report->counts ? report->counts[sig] >= report->limit : report->offsets[sig] != SIZE_MAX;
+}
+
+/* Records signature sig's next match, at start; returns whether it is done. */
+FP_INLINE int fp_record(const fp_report* report, size_t sig, size_t start) {
+    if (report->offsets && report->offsets[sig] == SIZE_MAX) report->offsets[sig] = start;
+    return !report->counts || ++report->counts[sig] >= report->limit;
+}
+
+/* Counts plan's matches at from and after into *count until it reaches
+ * limit, overlapping matches included, and returns the first it counts, or
+ * SIZE_MAX. */
+static size_t fp_count_from(const uint8_t* data, size_t size, const fp_plan* plan, size_t from, size_t* count,
+                            size_t limit) {
+    size_t first = SIZE_MAX;
+    if (plan->wildcard_only) {
+        /* Every start matches. */
+        const size_t starts = plan->length <= size - from ? size - from - plan->length + 1 : 0;
+        if (!starts || *count >= limit) return SIZE_MAX;
+        *count += starts < limit - *count ? starts : limit - *count;
+        return from;
+    }
+    while (*count < limit && plan->length <= size - from) {
+        const size_t pos = fp_plan_find(data + from, size - from, plan);
+        if (pos == SIZE_MAX) break;
+        if (first == SIZE_MAX) first = from + pos;
+        ++*count;
+        from += pos + 1;
+    }
+    return first;
+}
+
 /* Searches for signature index[0] to index[count - 1] one at a time, with
- * best the lowest offset found so far. Without offsets, only the lowest
+ * best the lowest offset found so far. Without a report, only the lowest
  * matters, so each signature searches only the prefix where it could start
  * lower. Returns the lowest offset. */
 static size_t fp_scan_each(const uint8_t* data, size_t size, const fp_set* set, const size_t* index,
-                           size_t count, size_t* offsets, size_t best) {
+                           size_t count, const fp_report* report, size_t best) {
     size_t i;
     for (i = 0; i < count; ++i) {
         const size_t sig = index ? index[i] : i;
         const fp_plan* plan = &fp_plans(set)[sig];
-        size_t limit = size, pos;
-        if (!offsets && best != SIZE_MAX) {
-            if (best == 0) break;
-            if (plan->length <= size && best - 1 < size - plan->length) limit = best - 1 + plan->length;
+        size_t pos;
+        if (report && report->counts) {
+            pos = fp_count_from(data, size, plan, 0, &report->counts[sig], report->limit);
+        } else {
+            size_t span = size;
+            if (!report && best != SIZE_MAX) {
+                if (best == 0) break;
+                if (plan->length <= size && best - 1 < size - plan->length) span = best - 1 + plan->length;
+            }
+            pos = fp_plan_find(data, span, plan);
         }
-        pos = fp_plan_find(data, limit, plan);
-        if (offsets) offsets[sig] = pos;
+        if (report && report->offsets) report->offsets[sig] = pos;
         if (pos < best) best = pos;
     }
     return best;
@@ -1442,38 +1490,44 @@ static size_t fp_scan_each(const uint8_t* data, size_t size, const fp_set* set, 
 /* Searches the group's members one by one once Teddy has verified every
  * window below from: a member's starts below from - offset are done. */
 static size_t fp_teddy_rest(const uint8_t* data, size_t size, const fp_set* set, const fp_teddy* group,
-                            size_t* offsets, size_t best, size_t from) {
+                            const fp_report* report, size_t best, size_t from) {
     size_t m;
     for (m = group->start[0]; m < group->start[8]; ++m) {
         const fp_member* member = &set->members[group->first + m];
-        const fp_plan* plan = &fp_plans(set)[member->sig];
+        const size_t sig = member->sig;
+        const fp_plan* plan = &fp_plans(set)[sig];
         const size_t resume = from > member->offset ? from - member->offset : 0;
-        size_t limit = size - resume, pos;
-        if (offsets ? offsets[member->sig] != SIZE_MAX : best <= resume) continue;
-        if (!offsets && best != SIZE_MAX && plan->length <= limit && best - 1 - resume < limit - plan->length)
-            limit = best - 1 - resume + plan->length;
-        pos = fp_plan_find(data + resume, limit, plan);
+        size_t pos;
+        if (report ? fp_done(report, sig) : best <= resume) continue;
+        if (report && report->counts) {
+            pos = fp_count_from(data, size, plan, resume, &report->counts[sig], report->limit);
+        } else {
+            size_t span = size - resume;
+            if (!report && best != SIZE_MAX && plan->length <= span && best - 1 - resume < span - plan->length)
+                span = best - 1 - resume + plan->length;
+            pos = fp_plan_find(data + resume, span, plan);
+            if (pos != SIZE_MAX) pos += resume;
+        }
         if (pos == SIZE_MAX) continue;
-        pos += resume;
-        if (offsets) offsets[member->sig] = pos;
+        if (report && report->offsets && report->offsets[sig] == SIZE_MAX) report->offsets[sig] = pos;
         if (pos < best) best = pos;
     }
     return best;
 }
 
 /* Scans for the members of one Teddy group, given best, the lowest offset
- * found so far, and returns the new lowest. With offsets, each member is
- * verified until found, and a bucket whose members are all found leaves the
+ * found so far, and returns the new lowest. With a report, each member is
+ * verified until done, and a bucket whose members are all done leaves the
  * tables, a copy local to this scan. Without, windows stop where no member
  * could start below best. */
 static size_t fp_teddy_group(const uint8_t* data, size_t size, const fp_set* set, const fp_teddy* group,
-                             size_t* offsets, size_t best, int backend) {
+                             const fp_report* report, size_t best, int backend) {
     const size_t width = fp_teddy_width(backend);
     fp_teddy_tables tables = group->tables;
     uint8_t buckets[64];
     unsigned left[8], live = 0, b;
     size_t i = 0, end = size - FP_TEDDY_LENGTH + 1, windows = 0, unfound = group->start[8];
-    if (!offsets && best != SIZE_MAX) {
+    if (!report && best != SIZE_MAX) {
         if (best == 0) return best;
         if (best + group->reach < end) end = best + group->reach;
     }
@@ -1499,16 +1553,16 @@ static size_t fp_teddy_group(const uint8_t* data, size_t size, const fp_set* set
                     size_t start;
                     if (window < member->offset) continue;
                     start = window - member->offset;
-                    if (plan->length > size - start || (offsets && offsets[member->sig] != SIZE_MAX) ||
+                    if (plan->length > size - start || (report && fp_done(report, member->sig)) ||
                         !fp_matches(data + start, plan)) {
                         continue;
                     }
                     if (start < best) best = start;
-                    if (!offsets) {
+                    if (!report) {
                         if (best + group->reach < end) end = best + group->reach;
                         continue;
                     }
-                    offsets[member->sig] = start;
+                    if (!fp_record(report, member->sig, start)) continue;
                     --unfound;
                     if (--left[bucket] == 0) {
                         live &= ~(1u << bucket);
@@ -1520,18 +1574,19 @@ static size_t fp_teddy_group(const uint8_t* data, size_t size, const fp_set* set
         }
         i = base + width;
         if (windows / unfound > (i > FP_TEDDY_WARMUP ? i : FP_TEDDY_WARMUP) / FP_TEDDY_COST)
-            return fp_teddy_rest(data, size, set, group, offsets, best, i);
+            return fp_teddy_rest(data, size, set, group, report, best, i);
     }
     return best;
 }
 
-static size_t fp_scan_teddy(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets, int backend) {
+static size_t fp_scan_teddy(const uint8_t* data, size_t size, const fp_set* set, const fp_report* report,
+                            int backend) {
     size_t i, best = SIZE_MAX;
-    if (offsets) {
-        for (i = 0; i < set->count; ++i) offsets[i] = SIZE_MAX;
+    if (report && report->offsets) {
+        for (i = 0; i < set->count; ++i) report->offsets[i] = SIZE_MAX;
     }
-    for (i = 0; i < set->groups; ++i) best = fp_teddy_group(data, size, set, &set->teddy[i], offsets, best, backend);
-    return fp_scan_each(data, size, set, set->stray, set->strays, offsets, best);
+    for (i = 0; i < set->groups; ++i) best = fp_teddy_group(data, size, set, &set->teddy[i], report, best, backend);
+    return fp_scan_each(data, size, set, set->stray, set->strays, report, best);
 }
 #endif
 
@@ -1543,15 +1598,23 @@ FP_NOINLINE size_t fp_scan_one(const uint8_t* data, size_t size, const fp_set* s
     return pos;
 }
 
-/* Sets of several signatures. */
-FP_NOINLINE size_t fp_scan_all(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets) {
+static size_t fp_scan_report(const uint8_t* data, size_t size, const fp_set* set, const fp_report* report) {
 #if defined(FP_X86)
     if (set->groups && size >= FP_TEDDY_SIZE) {
         const int backend = fp_get_backend();
-        if (backend >= FP_SSSE3) return fp_scan_teddy(data, size, set, offsets, backend);
+        if (backend >= FP_SSSE3) return fp_scan_teddy(data, size, set, report, backend);
     }
 #endif
-    return fp_scan_each(data, size, set, NULL, set->count, offsets, SIZE_MAX);
+    return fp_scan_each(data, size, set, NULL, set->count, report, SIZE_MAX);
+}
+
+/* Sets of several signatures. */
+FP_NOINLINE size_t fp_scan_all(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets) {
+    fp_report report;
+    report.offsets = offsets;
+    report.counts = NULL;
+    report.limit = 1;
+    return fp_scan_report(data, size, set, offsets ? &report : NULL);
 }
 
 size_t fp_scan(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets) {
@@ -1559,6 +1622,20 @@ size_t fp_scan(const uint8_t* data, size_t size, const fp_set* set, size_t* offs
     if (!data) size = 0;
     if (set->count == 1) return offsets ? fp_scan_one(data, size, set, offsets) : fp_plan_find(data, size, fp_plans(set));
     return fp_scan_all(data, size, set, offsets);
+}
+
+size_t fp_scan_counts(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets, size_t* counts,
+                      size_t limit) {
+    fp_report report;
+    size_t i;
+    if (!counts) return fp_scan(data, size, set, offsets);
+    if (!set) return SIZE_MAX;
+    if (!data) size = 0;
+    for (i = 0; i < set->count; ++i) counts[i] = 0;
+    report.offsets = offsets;
+    report.counts = counts;
+    report.limit = limit ? limit : SIZE_MAX;
+    return fp_scan_report(data, size, set, &report);
 }
 
 size_t fp_set_count(const fp_set* set) { return set ? set->count : 0; }

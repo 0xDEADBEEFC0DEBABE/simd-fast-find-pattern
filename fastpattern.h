@@ -54,6 +54,15 @@ fp_set* fp_set_from_bytes(const fp_sig* sigs, size_t count, fp_error* error);
  * and no byte outside data[0, size) is read. */
 size_t fp_scan(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets);
 
+/* fp_scan, also counting each signature's matches: counts[i] receives the
+ * number of offsets at which signature i matches, overlapping matches
+ * included, up to limit, where the scan stops looking for it; a limit of 0
+ * means none. With a limit of 2, one pass tells unique signatures (count 1)
+ * from repeated ones (2). offsets may be NULL; with NULL counts, this is
+ * fp_scan. */
+size_t fp_scan_counts(const uint8_t* data, size_t size, const fp_set* set, size_t* offsets, size_t* counts,
+                      size_t limit);
+
 /* The number of signatures in set, or 0 for NULL. */
 size_t fp_set_count(const fp_set* set);
 /* fp_set_free(NULL) is safe. */

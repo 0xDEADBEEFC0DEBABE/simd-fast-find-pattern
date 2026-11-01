@@ -54,6 +54,29 @@ static size_t reference_find(const uint8_t *data, size_t data_size,
     return SIZE_MAX;
 }
 
+/* The number of offsets at which the pattern matches, overlapping ones
+ * included, up to limit. */
+static size_t reference_count(const uint8_t *data, size_t data_size,
+                              const uint8_t *pattern, size_t pattern_size,
+                              const uint8_t *mask, size_t limit)
+{
+    size_t offset, count = 0;
+    if (!data || !pattern || !pattern_size || pattern_size > data_size) {
+        return 0;
+    }
+    for (offset = 0; offset <= data_size - pattern_size && count < limit; ++offset) {
+        size_t j;
+        for (j = 0; j < pattern_size; ++j) {
+            const unsigned significant = mask ? mask[j] : 255u;
+            if (((unsigned)data[offset + j] ^ pattern[j]) & significant) {
+                break;
+            }
+        }
+        count += j == pattern_size;
+    }
+    return count;
+}
+
 static uint32_t random_state = UINT32_C(0x1234abcd);
 
 static uint32_t next_random(void)
@@ -67,13 +90,19 @@ static uint32_t next_random(void)
 }
 
 /* Every search is checked both as fp_scan's return value and through
- * offsets, which for one signature must agree. */
+ * offsets, which for one signature must agree, and counted to 2, which
+ * finds the same match, and a second one where fp_scan finds one past it. */
 static size_t scan_set(const uint8_t *data, size_t size, const fp_set *set)
 {
-    size_t offset = 0;
+    size_t offset = 0, count = 7;
     const size_t result = fp_scan(data, size, set, NULL);
     CHECK_EQ(fp_scan(data, size, set, &offset), result);
     CHECK_EQ(offset, result);
+    offset = 7;
+    CHECK_EQ(fp_scan_counts(data, size, set, &offset, &count, 2), result);
+    CHECK_EQ(offset, result);
+    CHECK_EQ(count, result == SIZE_MAX ? 0
+                    : 1 + (fp_scan(data + result + 1, size - result - 1, set, NULL) != SIZE_MAX));
     return result;
 }
 
@@ -122,6 +151,7 @@ static void test_arguments(void)
     const uint8_t partial_data[] = {0xf2, 0xa7, 0x3c};
     const char *texts[2] = {"10 20", NULL};
     size_t offsets[2] = {7, 7};
+    size_t counts[2] = {7, 7};
     fp_sig sigs[2];
     fp_error error;
     fp_set *set;
@@ -193,10 +223,37 @@ static void test_arguments(void)
     CHECK_EQ(offsets[0], SIZE_MAX);
     CHECK_EQ(offsets[1], SIZE_MAX);
     CHECK_EQ(fp_scan(data, 0, set, offsets), SIZE_MAX);
+
+    /* Counting: 10 20 matches twice, ?? FF once. */
+    CHECK_EQ(fp_scan_counts(data, sizeof(data), set, offsets, counts, 0), 1);
+    CHECK_EQ(counts[0], 2);
+    CHECK_EQ(counts[1], 1);
+    CHECK_EQ(offsets[0], 1);
+    CHECK_EQ(offsets[1], 4);
+    CHECK_EQ(fp_scan_counts(data, sizeof(data), set, NULL, counts, 1), 1);
+    CHECK_EQ(counts[0], 1);
+    CHECK_EQ(counts[1], 1);
+    CHECK_EQ(fp_scan_counts(data + 2, sizeof(data) - 2, set, offsets, counts, 2), 1);
+    CHECK_EQ(counts[0], 1);
+    CHECK_EQ(counts[1], 1);
+    CHECK_EQ(offsets[0], 1);
+    CHECK_EQ(offsets[1], 2);
+    CHECK_EQ(fp_scan_counts(NULL, sizeof(data), set, offsets, counts, 2), SIZE_MAX);
+    CHECK_EQ(counts[0], 0);
+    CHECK_EQ(counts[1], 0);
+    CHECK_EQ(offsets[0], SIZE_MAX);
+    CHECK_EQ(offsets[1], SIZE_MAX);
+    /* Without counts, it is fp_scan. */
+    CHECK_EQ(fp_scan_counts(data, sizeof(data), set, offsets, NULL, 2), 1);
+    CHECK_EQ(offsets[0], 1);
+    CHECK_EQ(offsets[1], 4);
     fp_set_free(set);
     offsets[0] = 7;
+    counts[0] = 7;
     CHECK_EQ(fp_scan(data, sizeof(data), NULL, offsets), SIZE_MAX);
+    CHECK_EQ(fp_scan_counts(data, sizeof(data), NULL, offsets, counts, 2), SIZE_MAX);
     CHECK_EQ(offsets[0], 7);
+    CHECK_EQ(counts[0], 7);
     CHECK_EQ(fp_set_count(NULL), 0);
     fp_set_free(NULL);
     CHECK_EQ(fp_ver() != NULL && fp_ver()[0] != '\0', 1);
@@ -600,8 +657,9 @@ static void test_random(void)
 
 /* Random sets of up to max_count signatures (masks drawn like
  * test_random_sizes, lengths up to 24) in buffers of up to max_size bytes,
- * some with members planted. Every offset is checked, the return value is
- * their minimum, and scanning without offsets agrees. */
+ * some with members planted, a few several times. Every offset is checked,
+ * the return value is their minimum, and scanning without offsets agrees;
+ * so does counting to a random limit, against reference counts. */
 static void test_random_sets(size_t iterations, size_t max_count, size_t max_size, unsigned alphabet)
 {
     static uint8_t storage[16384 + 64];
@@ -610,12 +668,14 @@ static void test_random_sets(size_t iterations, size_t max_count, size_t max_siz
     static fp_sig sigs[256];
     static size_t offsets[256];
     static size_t expected[256];
+    static size_t counts[256];
+    static size_t tallies[256];
     size_t iteration;
     for (iteration = 0; iteration < iterations; ++iteration) {
         const size_t count = 1 + next_random() % max_count;
         const size_t n = next_random() % (max_size + 1);
         uint8_t *data = storage + next_random() % 64;
-        size_t i, j, lowest = SIZE_MAX;
+        size_t i, j, limit, lowest = SIZE_MAX;
         fp_set *set;
         for (j = 0; j < n; ++j) {
             data[j] = (uint8_t)(alphabet ? next_random() % alphabet : next_random());
@@ -637,11 +697,14 @@ static void test_random_sets(size_t iterations, size_t max_count, size_t max_siz
             sigs[i].mask = mode == 0 ? NULL : masks[i];
             sigs[i].length = m;
             if (m <= n && next_random() % 3 == 0) {
-                const size_t location = next_random() % (n - m + 1);
-                for (j = 0; j < m; ++j) {
-                    const uint8_t significant = sigs[i].mask ? masks[i][j] : 0xff;
-                    data[location + j] = (uint8_t)((data[location + j] & (uint8_t)~significant) |
-                                                   (patterns[i][j] & significant));
+                size_t copies = next_random() % 4 ? 1 : 2 + next_random() % 3;
+                for (; copies; --copies) {
+                    const size_t location = next_random() % (n - m + 1);
+                    for (j = 0; j < m; ++j) {
+                        const uint8_t significant = sigs[i].mask ? masks[i][j] : 0xff;
+                        data[location + j] = (uint8_t)((data[location + j] & (uint8_t)~significant) |
+                                                       (patterns[i][j] & significant));
+                    }
                 }
             }
         }
@@ -662,6 +725,22 @@ static void test_random_sets(size_t iterations, size_t max_count, size_t max_siz
             CHECK_EQ(offsets[i], expected[i]);
         }
         CHECK_EQ(fp_scan(data, n, set, NULL), lowest);
+        /* A limit of 0 counts every match. */
+        limit = next_random() % 4;
+        for (i = 0; i < count; ++i) {
+            tallies[i] = reference_count(data, n, sigs[i].bytes, sigs[i].length, sigs[i].mask,
+                                         limit ? limit : SIZE_MAX);
+            offsets[i] = counts[i] = 7;
+        }
+        CHECK_EQ(fp_scan_counts(data, n, set, offsets, counts, limit), lowest);
+        for (i = 0; i < count; ++i) {
+            CHECK_EQ(offsets[i], expected[i]);
+            CHECK_EQ(counts[i], tallies[i]);
+        }
+        CHECK_EQ(fp_scan_counts(data, n, set, NULL, counts, limit), lowest);
+        for (i = 0; i < count; ++i) {
+            CHECK_EQ(counts[i], tallies[i]);
+        }
         fp_set_free(set);
     }
 }
@@ -672,7 +751,8 @@ static void test_random_sets(size_t iterations, size_t max_count, size_t max_siz
  * window is a candidate, so the group soon gives way to single searches,
  * which must resume where each member's starts were last covered; the
  * planted match moves across that point, which depends on the vector width
- * and the number of members. */
+ * and the number of members. Counting, the member also matches well before
+ * and after it, and each match counts once. */
 static void test_set_edges(void)
 {
     static uint8_t data[8192];
@@ -688,7 +768,7 @@ static void test_set_edges(void)
     static const size_t flood_lengths[5] = {6, 7, 5, 8, 8};
     uint8_t late[21], late_mask[21];
     fp_sig sigs[6];
-    size_t offsets[6], planted, i;
+    size_t offsets[6], counts[6], planted, i;
     fp_set *set;
     /* late: 16 wildcards, then A5 A1 AD 9E; it starts 10 before rare_a. */
     memset(late, 0, sizeof(late));
@@ -743,6 +823,17 @@ static void test_set_edges(void)
         }
         CHECK_EQ(fp_scan(data, sizeof(data), set, NULL), planted - 20);
     }
+    for (planted = 2000; planted < 4500; ++planted) {
+        memset(data, 0x41, sizeof(data));
+        data[500] = data[planted] = data[7000] = 0x7e;
+        CHECK_EQ(fp_scan_counts(data, sizeof(data), set, offsets, counts, 0), 480);
+        for (i = 0; i < 6; ++i) {
+            CHECK_EQ(counts[i], i == 1 ? 3 : 0);
+            CHECK_EQ(offsets[i], i == 1 ? 480 : SIZE_MAX);
+        }
+        CHECK_EQ(fp_scan_counts(data, sizeof(data), set, NULL, counts, 2), 480);
+        CHECK_EQ(counts[1], 2);
+    }
     fp_set_free(set);
 }
 
@@ -756,6 +847,40 @@ static void test_sets(void)
     test_random_sets(150, 256, 16384, 16);
     /* Two symbols: every window is a candidate, and groups give way to single searches. */
     test_random_sets(300, 40, 16384, 2);
+}
+
+/* Overlapping matches at each limit, a wildcard-only signature, and a set
+ * holding one signature twice. */
+static void test_counts(void)
+{
+    static const uint8_t data[] = {0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x42};
+    const char *texts[4] = {"41 41", "4? 41", "?? ??", "41 41"};
+    size_t offsets[4], counts[4], limit, i;
+    fp_set *set = fp_set_from_text(texts, 4, NULL);
+    CHECK_EQ(set != NULL, 1);
+    for (limit = 0; limit <= 7; ++limit) {
+        const size_t pairs = limit && limit < 5 ? limit : 5;
+        CHECK_EQ(fp_scan_counts(data, sizeof(data), set, offsets, counts, limit), 0);
+        CHECK_EQ(counts[0], pairs);
+        CHECK_EQ(counts[1], pairs);
+        CHECK_EQ(counts[2], limit && limit < 6 ? limit : 6);
+        CHECK_EQ(counts[3], pairs);
+        for (i = 0; i < 4; ++i) {
+            CHECK_EQ(offsets[i], 0);
+        }
+    }
+    /* In the last two bytes only ?? ?? matches; in one byte, nothing. */
+    CHECK_EQ(fp_scan_counts(data + 5, 2, set, offsets, counts, 0), 0);
+    for (i = 0; i < 4; ++i) {
+        CHECK_EQ(counts[i], i == 2);
+        CHECK_EQ(offsets[i], i == 2 ? 0 : SIZE_MAX);
+    }
+    CHECK_EQ(fp_scan_counts(data, 1, set, offsets, counts, 0), SIZE_MAX);
+    for (i = 0; i < 4; ++i) {
+        CHECK_EQ(counts[i], 0);
+        CHECK_EQ(offsets[i], SIZE_MAX);
+    }
+    fp_set_free(set);
 }
 
 static void test_random_parser(void)
@@ -896,7 +1021,7 @@ static void test_guard_pages(void)
         uint8_t *data = data_region.page + data_region.page_size - n;
         uint8_t tail[13];
         fp_sig sigs[9];
-        size_t offsets[9], j;
+        size_t offsets[9], counts[9], j;
         fp_set *set;
         if (n < 12) {
             continue;
@@ -923,6 +1048,10 @@ static void test_guard_pages(void)
         }
         CHECK_EQ(offsets[8], SIZE_MAX);
         CHECK_EQ(fp_scan(data, n, set, NULL), n - 12);
+        CHECK_EQ(fp_scan_counts(data, n, set, NULL, counts, 0), n - 12);
+        for (j = 0; j < 9; ++j) {
+            CHECK_EQ(counts[j], j < 8);
+        }
         fp_set_free(set);
     }
     /* The parser may inspect a token and its terminator, but nothing beyond it. */
@@ -958,6 +1087,7 @@ int main(void)
     test_masked_ends();
     test_random();
     test_sets();
+    test_counts();
     test_random_parser();
     test_guard_pages();
     printf("Passed %lu checks; %s\n", checks, fp_cpuinfo());
