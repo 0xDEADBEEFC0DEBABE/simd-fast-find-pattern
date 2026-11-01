@@ -28,7 +28,7 @@ With multi-configuration generators, executables are in the configuration direct
 cl /O2 /std:c11 example_simple.c fastpattern.c /Fe:fp_example.exe
 ```
 
-Do not apply global `-march=native`, `-mavx2`, `-mavx512*`, or `/arch:AVX2` options when distributing a binary to CPUs with different features. Such options can introduce unsupported instructions into common code before runtime dispatch. GCC and Clang SIMD functions use individual target attributes, so these global flags are unnecessary.
+Do not apply global `-march=native`, `-mavx2`, `-mavx512*`, or `/arch:AVX2` options when distributing a binary to CPUs with different features. Such options can introduce unsupported instructions into common code before runtime dispatch. GCC and Clang SIMD functions use individual target attributes, and MSVC compiles the AVX2 and AVX-512 intrinsics without `/arch`, so these global flags are unnecessary.
 
 For a scalar build, add `-DFP_DISABLE_SIMD` when compiling, or configure CMake with `-DFASTPATTERN_DISABLE_SIMD=ON`. `FP_DISABLE_SIMD` disables this library's explicit SIMD paths; compiler auto-vectorization and C library routines may still use vector instructions. On supported GCC/Clang builds, `-DFASTPATTERN_SANITIZE=ON` enables AddressSanitizer and UndefinedBehaviorSanitizer; use a separate build directory for this configuration.
 
@@ -133,8 +133,8 @@ On a Ryzen 9 7950X (AVX-512BW, Windows, Clang 22), one scan of 66 MB of code fro
 
 | Build target | Available implementations |
 | --- | --- |
-| x86 with GCC or Clang | Scalar, SSE2, SSSE3 (signature sets), AVX2, AVX-512BW; selected using runtime CPU/OS support |
-| x86 with MSVC | Baseline SSE2 where available, SSSE3 for signature sets, otherwise scalar |
+| x86 with GCC, Clang, or MSVC (Visual Studio 2017 15.3 or later) | Scalar, SSE2, SSSE3 (signature sets), AVX2, AVX-512BW; selected using runtime CPU/OS support |
+| x86 with older MSVC | Baseline SSE2 where available, SSSE3 for signature sets, otherwise scalar |
 | AArch64 with GCC, Clang, or MSVC | NEON and scalar; sets search each signature in turn |
 | Other compiler/architecture combinations, or `FP_DISABLE_SIMD` | Portable scalar implementation |
 

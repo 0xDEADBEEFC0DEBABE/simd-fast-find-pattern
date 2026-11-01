@@ -31,8 +31,14 @@
 #define FP_TARGET_INLINE(isa) inline __attribute__((target(isa), always_inline))
 #define FP_WIDE_X86 1
 #else
+/* MSVC compiles AVX2 and AVX-512 intrinsics without /arch options (since
+ * Visual Studio 2017 15.3 for AVX-512), and the runtime checks choose what
+ * runs, as with GCC and Clang. */
 #define FP_TARGET(isa) __declspec(noinline)
 #define FP_TARGET_INLINE(isa) __forceinline
+#if defined(_MSC_VER) && _MSC_VER >= 1911
+#define FP_WIDE_X86 1
+#endif
 #endif
 #elif !defined(FP_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
 #define FP_NEON 1
@@ -94,8 +100,9 @@ static int fp_detect_backend(void) {
             fp_cpuid(7, 0, regs);
             if (regs[1] & (1u << 5)) {
                 backend = FP_AVX2;
-                if (FP_MAX_SIMD_BITS >= 512 && (xcr0 & 0xe6u) == 0xe6u &&
-                    (regs[1] & ((1u << 16) | (1u << 30))) == ((1u << 16) | (1u << 30))) {
+                if ((xcr0 & 0xe6u) == 0xe6u &&
+                    (regs[1] & ((1u << 16) | (1u << 30))) == ((1u << 16) | (1u << 30)) &&
+                    FP_MAX_SIMD_BITS >= 512) {
                     backend = FP_AVX512;
                 }
             }
@@ -382,7 +389,7 @@ FP_NOINLINE size_t fp_masked_small(const uint8_t* data, size_t size, const uint8
 FP_TARGET_INLINE(ATTR) static size_t NAME##_pair(const uint8_t* data, size_t base, uint64_t lo, uint64_t hi, \
                                                  const fp_plan* plan) { \
     size_t j = plan->first, pos; \
-    if (WIDTH == 16 && !plan->mask && plan->length - 8 <= 8) { \
+    if (!plan->mask && plan->length - 8 <= 8 && WIDTH == 16) { \
         pos = fp_verify_exact8(data, base, lo, plan->bytes, plan->length); \
         return pos != SIZE_MAX ? pos : fp_verify_exact8(data, base + WIDTH, hi, plan->bytes, plan->length); \
     } \
