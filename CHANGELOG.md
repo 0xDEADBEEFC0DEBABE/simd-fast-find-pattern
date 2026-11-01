@@ -7,8 +7,10 @@
 - x86: verify candidates with inline word compares instead of `memcmp`, keep calls out of the scan loops, unroll them twice, and finish with an overlapping final vector instead of a scalar tail.
 - Pair the first anchor with the last differing exact byte when the first and last pattern bytes are equal, and on x86 narrow dense candidate blocks one pattern byte at a time across all lanes.
 - x86 exact searches skip planning: `fp_find`, with no stack frame, reaches a small leaf function through a few conditional tail jumps. The leaves are sized to the number of starts, and 8- to 16-byte patterns get a branch-free two-word verification; AVX-512 uses masked loads for the shortest buffers.
+- x86 masked searches whose first and last pattern bytes are exact take the same fast path, verifying 8- to 16-byte patterns as two masked words. Compiled patterns, and masks planned because of wildcard or nibble-masked ends, use it for the bytes between their first and last constrained ones when those are exact. `fp_find_compiled` no longer inlines the general search, which had every compiled search save eight registers.
+- x86 long scans start where the first anchor's vector loads are aligned, so throughput depends less on the buffer's alignment.
 - Read the cached x86 backend without a locked instruction; clang builds targeting MSVC previously paid an interlocked compare-exchange on every search.
-- Add a dense-candidate regression test, long exact-search and low-entropy random tests, guard-page checks up to 4096 bytes, plus Linux GCC and Windows MSVC ARM64 CI jobs.
+- Add a dense-candidate regression test, long exact-search, masked exact-end, and low-entropy random tests, guard-page checks up to 4096 bytes (including compiled patterns), plus Linux GCC and Windows MSVC ARM64 CI jobs.
 
 ## 1.1.0
 

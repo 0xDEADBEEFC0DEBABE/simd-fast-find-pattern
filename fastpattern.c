@@ -17,6 +17,18 @@
 #define FP_INLINE static
 #define FP_NOINLINE static
 #endif
+/* Makes the call in a return statement a tail call; the callee must take
+ * the caller's parameter types. With the mask passed on the stack (Win64,
+ * 32-bit x86), compilers otherwise tend to give fp_find a frame and call
+ * the masked leaves. */
+#if defined(__has_attribute)
+#if __has_attribute(musttail)
+#define FP_MUSTTAIL __attribute__((musttail))
+#endif
+#endif
+#if !defined(FP_MUSTTAIL)
+#define FP_MUSTTAIL
+#endif
 
 #if !defined(FP_DISABLE_SIMD) && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
 #define FP_X86 1
@@ -141,6 +153,8 @@ typedef struct {
     size_t last;
     size_t second;
     int wildcard_only;
+    /* Masked, with exact bytes at first and last. */
+    int anchored;
 } fp_plan;
 
 struct fp_pattern { fp_plan plan; };
@@ -151,6 +165,7 @@ FP_INLINE void fp_prepare(fp_plan* plan, const uint8_t* bytes, size_t length,
     plan->bytes = bytes;
     plan->length = length;
     plan->wildcard_only = 0;
+    plan->anchored = 0;
     if (mask) {
         int exact = 1;
         size_t j;
@@ -172,6 +187,7 @@ FP_INLINE void fp_prepare(fp_plan* plan, const uint8_t* bytes, size_t length,
     plan->first = first;
     plan->last = last;
     plan->second = last;
+    plan->anchored = mask && (mask[first] & mask[last]) == 0xff;
     /* Filters test the first constrained byte and a second anchor. Identical
      * exact anchors pass every offset in a run of that byte, such as zero or
      * 0xcc padding, so pair the first byte with the last exact byte that
@@ -296,12 +312,52 @@ FP_INLINE size_t fp_verify_exact8(const uint8_t* data, size_t base, uint64_t bit
     return SIZE_MAX;
 }
 
+/* The offset, below width (a power of two), at which p becomes aligned. */
+FP_INLINE size_t fp_aligned_start(const uint8_t* p, size_t width) {
+    return (size_t)(0 - (uintptr_t)p) & (width - 1);
+}
+
 /* Exact search of a buffer shorter than any vector. */
 FP_NOINLINE size_t fp_exact_small(const uint8_t* data, size_t size, const uint8_t* pattern, size_t length) {
     const size_t count = size - length + 1;
     size_t pos;
     for (pos = 0; pos < count; ++pos) {
         if (data[pos] == pattern[0] && fp_equal(data + pos, pattern, NULL, length)) return pos;
+    }
+    return SIZE_MAX;
+}
+
+/* The same for masked patterns whose first and last bytes are exact, which
+ * the masked leaves below search like exact ones. fp_verify_masked8 is
+ * fp_verify_exact8 under the mask. */
+FP_INLINE size_t fp_verify_masked(const uint8_t* data, size_t base, uint64_t bits,
+                                  const uint8_t* pattern, size_t length, const uint8_t* mask) {
+    for (; bits; bits &= bits - 1) {
+        const size_t pos = base + fp_first_bit(bits);
+        if (fp_equal(data + pos, pattern, mask, length)) return pos;
+    }
+    return SIZE_MAX;
+}
+
+FP_INLINE size_t fp_verify_masked8(const uint8_t* data, size_t base, uint64_t bits,
+                                   const uint8_t* pattern, size_t length, const uint8_t* mask) {
+    const size_t tail = length - 8;
+    const uint64_t head = fp_load64(pattern), head_mask = fp_load64(mask);
+    const uint64_t last = fp_load64(pattern + tail), last_mask = fp_load64(mask + tail);
+    for (; bits; bits &= bits - 1) {
+        const uint8_t* q = data + base + fp_first_bit(bits);
+        if ((((fp_load64(q) ^ head) & head_mask) | ((fp_load64(q + tail) ^ last) & last_mask)) == 0)
+            return (size_t)(q - data);
+    }
+    return SIZE_MAX;
+}
+
+FP_NOINLINE size_t fp_masked_small(const uint8_t* data, size_t size, const uint8_t* pattern, size_t length,
+                                   const uint8_t* mask) {
+    const size_t count = size - length + 1;
+    size_t pos;
+    for (pos = 0; pos < count; ++pos) {
+        if (data[pos] == pattern[0] && fp_equal(data + pos, pattern, mask, length)) return pos;
     }
     return SIZE_MAX;
 }
@@ -322,7 +378,12 @@ FP_NOINLINE size_t fp_exact_small(const uint8_t* data, size_t size, const uint8_
  * Win64 does not preserve ymm/zmm upper halves, so a call would make the
  * compiler reload the broadcasts on every iteration. The final block ends
  * exactly at the last candidate and masks lanes already scanned, so no
- * scalar tail is needed. NAME_long plans an exact pattern and scans it. */
+ * scalar tail is needed. NAME_long_exact and NAME_long_mask plan an exact or
+ * masked pattern and scan it; masked plans gain nothing from a copy of the
+ * scan specialized for them, so NAME_long_mask calls NAME. Their callers
+ * (NAME_lead) have checked the first WIDTH starts, so the scan begins where
+ * the first anchor's loads are aligned, and only the second anchor's may
+ * split cache lines. */
 #define FP_DEFINE_X86_SEARCH(NAME, ATTR, VECTOR, LANES, WIDTH, SET, LOAD, AND, EQ, MATCH, ANY, BITS) \
 FP_TARGET_INLINE(ATTR) static size_t NAME##_pair(const uint8_t* data, size_t base, uint64_t lo, uint64_t hi, \
                                                  const fp_plan* plan) { \
@@ -390,37 +451,53 @@ FP_TARGET_INLINE(ATTR) static size_t NAME##_scan(const uint8_t* data, size_t cou
 FP_TARGET(ATTR) static size_t NAME(const uint8_t* data, size_t count, size_t i, const fp_plan* plan) { \
     return NAME##_scan(data, count, i, plan); \
 } \
-FP_TARGET(ATTR) static size_t NAME##_long(const uint8_t* data, size_t size, const uint8_t* pattern, \
-                                          size_t length) { \
+FP_TARGET(ATTR) static size_t NAME##_long_exact(const uint8_t* data, size_t size, const uint8_t* pattern, \
+                                                size_t length) { \
     fp_plan plan; \
     fp_prepare(&plan, pattern, length, NULL); \
-    return NAME##_scan(data, size - length + 1, 0, &plan); \
+    return NAME##_scan(data, size - length + 1, fp_aligned_start(data + plan.first, WIDTH), &plan); \
+} \
+FP_TARGET(ATTR) static size_t NAME##_long_mask(const uint8_t* data, size_t size, const uint8_t* pattern, \
+                                               size_t length, const uint8_t* mask) { \
+    fp_plan plan; \
+    fp_prepare(&plan, pattern, length, mask); \
+    return NAME(data, size - length + 1, fp_aligned_start(data + plan.first, WIDTH), &plan); \
 }
 #define FP_SSE_LOAD(p) _mm_loadu_si128((const __m128i*)(const void*)(p))
 #define FP_SSE_BITS(x) ((uint64_t)(unsigned int)_mm_movemask_epi8(x))
 #define FP_SSE_EQ(x, y) FP_SSE_BITS(_mm_cmpeq_epi8((x), (y)))
 #define FP_SSE_MATCH(x, xv, y, yv) _mm_and_si128(_mm_cmpeq_epi8((x), (xv)), _mm_cmpeq_epi8((y), (yv)))
 #define FP_SSE_ANY(x, y) _mm_movemask_epi8(_mm_or_si128((x), (y)))
-/* Exact patterns need no prior planning and are anchored on their first and
- * last bytes. FP_RETURN_EXACT dispatches them by tail call to small leaf
- * functions of two kinds: suffix _w for patterns of 8 to 16 bytes (see
- * fp_verify_exact8), _s for all others. NAME_one handles up to 64 starts,
- * NAME_two up to 128 (SSE2 uses NAME_small), NAME_small up to 1024, and
- * NAME_lead everything else. */
-/* Up to 64 exact starts, gathered into one candidate mask before a single
+/* Exact patterns, and masked ones whose first and last bytes are exact,
+ * need no prior planning and are anchored on those bytes. FP_RETURN_EXACT
+ * and FP_RETURN_MASKED dispatch them by tail call to small leaf functions of
+ * four kinds: _s and _w for exact patterns, _ms and _mw for masked ones,
+ * where _w and _mw are for patterns of 8 to 16 bytes (see fp_verify_exact8).
+ * A kind's CLASS, _exact or _mask, gives its parameters after the buffer
+ * (fp_find's, without or with the mask) and its scalar search for buffers
+ * shorter than a vector. NAME_one handles up to 64 starts, NAME_two up to
+ * 128 (SSE2 uses NAME_small), NAME_small up to 1024, and NAME_lead
+ * everything else. */
+#define FP_PARAMS_exact const uint8_t* pattern, size_t length
+#define FP_PARAMS_mask const uint8_t* pattern, size_t length, const uint8_t* mask
+#define FP_ARGS_exact pattern, length
+#define FP_ARGS_mask pattern, length, mask
+#define FP_SMALL_exact fp_exact_small
+#define FP_SMALL_mask fp_masked_small
+/* Up to 64 starts, gathered into one candidate mask before a single
  * verification loop. The last block ends at the last start and overlaps the
  * one before; ORing the same bits twice is harmless. With fewer than WIDTH
  * starts, the last-byte block ends at the buffer end; shifting it down to
  * line up with the first-byte block also clears the lanes past the last
  * start. A buffer shorter than a vector goes to the next narrower width,
  * NARROW. */
-#define FP_DEFINE_X86_ONE(NAME, KIND, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, EQ, MATCH, BITS, NARROW) \
+#define FP_DEFINE_X86_ONE(NAME, KIND, CLASS, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, EQ, MATCH, BITS, NARROW) \
 FP_TARGET_INLINE(ATTR) static size_t NAME##_one_core##KIND(const uint8_t* data, size_t size, \
-                                                           const uint8_t* pattern, size_t length) { \
+                                                           FP_PARAMS##CLASS) { \
     const size_t count = size - length + 1, last = length - 1; \
     uint64_t bits; \
     size_t j, base; \
-    if (size < WIDTH) return NARROW(data, size, pattern, length); \
+    if (size < WIDTH) return NARROW(data, size, FP_ARGS##CLASS); \
     if (count < WIDTH) { \
         bits = EQ(LOAD(data), SET((char)pattern[0])) & \
                (EQ(LOAD(data + size - WIDTH), SET((char)pattern[last])) >> (WIDTH - count)); \
@@ -431,18 +508,16 @@ FP_TARGET_INLINE(ATTR) static size_t NAME##_one_core##KIND(const uint8_t* data, 
         for (j = 0; j < base; j += WIDTH) \
             bits |= BITS(MATCH(LOAD(data + j), av, LOAD(data + j + last), bv)) << j; \
     } \
-    return VERIFY(data, 0, bits, pattern, length); \
+    return VERIFY(data, 0, bits, FP_ARGS##CLASS); \
 } \
-FP_TARGET(ATTR) static size_t NAME##_one##KIND(const uint8_t* data, size_t size, const uint8_t* pattern, \
-                                               size_t length) { \
-    return NAME##_one_core##KIND(data, size, pattern, length); \
+FP_TARGET(ATTR) static size_t NAME##_one##KIND(const uint8_t* data, size_t size, FP_PARAMS##CLASS) { \
+    return NAME##_one_core##KIND(data, size, FP_ARGS##CLASS); \
 }
-/* 65 to 128 exact starts in two candidate masks, lo for starts 0-63 from
- * whole blocks and hi for the rest; the last block ends at the last start
- * and may straddle both. */
-#define FP_DEFINE_X86_TWO(NAME, KIND, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, MATCH, BITS) \
-FP_TARGET(ATTR) static size_t NAME##_two##KIND(const uint8_t* data, size_t size, const uint8_t* pattern, \
-                                               size_t length) { \
+/* 65 to 128 starts in two candidate masks, lo for starts 0-63 from whole
+ * blocks and hi for the rest; the last block ends at the last start and may
+ * straddle both. */
+#define FP_DEFINE_X86_TWO(NAME, KIND, CLASS, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, MATCH, BITS) \
+FP_TARGET(ATTR) static size_t NAME##_two##KIND(const uint8_t* data, size_t size, FP_PARAMS##CLASS) { \
     const size_t count = size - length + 1, last = length - 1, base = count - WIDTH; \
     const VECTOR av = SET((char)pattern[0]), bv = SET((char)pattern[last]); \
     uint64_t lo = 0, hi = 0, bits; \
@@ -451,16 +526,15 @@ FP_TARGET(ATTR) static size_t NAME##_two##KIND(const uint8_t* data, size_t size,
     for (; j < base; j += WIDTH) hi |= BITS(MATCH(LOAD(data + j), av, LOAD(data + j + last), bv)) << (j - 64); \
     bits = BITS(MATCH(LOAD(data + base), av, LOAD(data + base + last), bv)); \
     hi |= base >= 64 ? bits << (base - 64) : bits >> (64 - base); \
-    pos = VERIFY(data, 0, lo, pattern, length); \
-    return pos != SIZE_MAX ? pos : VERIFY(data, 64, hi, pattern, length); \
+    pos = VERIFY(data, 0, lo, FP_ARGS##CLASS); \
+    return pos != SIZE_MAX ? pos : VERIFY(data, 64, hi, FP_ARGS##CLASS); \
 }
-/* NAME_small: more than WIDTH exact starts, two blocks per test, the last
- * block overlapping the one before. NAME_lead checks the first WIDTH starts
- * (at least 32) with the one-block code before NAME_long plans the search,
- * so early matches in long buffers skip the planning. */
-#define FP_DEFINE_X86_EXACT(NAME, KIND, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, MATCH, BITS) \
-FP_TARGET(ATTR) static size_t NAME##_small##KIND(const uint8_t* data, size_t size, const uint8_t* pattern, \
-                                                 size_t length) { \
+/* NAME_small: more than WIDTH starts, two blocks per test, the last block
+ * overlapping the one before. NAME_lead checks the first WIDTH starts (at
+ * least 32) with the one-block code before the long search plans the
+ * pattern, so early matches in long buffers skip the planning. */
+#define FP_DEFINE_X86_SMALL(NAME, KIND, CLASS, VERIFY, ATTR, VECTOR, WIDTH, SET, LOAD, MATCH, BITS) \
+FP_TARGET(ATTR) static size_t NAME##_small##KIND(const uint8_t* data, size_t size, FP_PARAMS##CLASS) { \
     const size_t last = length - 1; \
     const uint8_t* const end = data + size - last - WIDTH; \
     const VECTOR av = SET((char)pattern[0]), bv = SET((char)pattern[last]); \
@@ -471,33 +545,34 @@ FP_TARGET(ATTR) static size_t NAME##_small##KIND(const uint8_t* data, size_t siz
         bits = BITS(MATCH(LOAD(p), av, LOAD(p + last), bv)); \
         next = BITS(MATCH(LOAD(p + WIDTH), av, LOAD(p + WIDTH + last), bv)); \
         if (bits | next) { \
-            if ((pos = VERIFY(data, (size_t)(p - data), bits, pattern, length)) != SIZE_MAX) return pos; \
-            if ((pos = VERIFY(data, (size_t)(p - data) + WIDTH, next, pattern, length)) != SIZE_MAX) return pos; \
+            if ((pos = VERIFY(data, (size_t)(p - data), bits, FP_ARGS##CLASS)) != SIZE_MAX) return pos; \
+            if ((pos = VERIFY(data, (size_t)(p - data) + WIDTH, next, FP_ARGS##CLASS)) != SIZE_MAX) return pos; \
         } \
     } \
     if (p < end) { \
         bits = BITS(MATCH(LOAD(p), av, LOAD(p + last), bv)); \
-        if (bits && (pos = VERIFY(data, (size_t)(p - data), bits, pattern, length)) != SIZE_MAX) return pos; \
+        if (bits && (pos = VERIFY(data, (size_t)(p - data), bits, FP_ARGS##CLASS)) != SIZE_MAX) return pos; \
         p += WIDTH; \
     } \
     bits = BITS(MATCH(LOAD(end), av, LOAD(end + last), bv)) & (~UINT64_C(0) << (p - end)); \
-    return VERIFY(data, (size_t)(end - data), bits, pattern, length); \
+    return VERIFY(data, (size_t)(end - data), bits, FP_ARGS##CLASS); \
 } \
-FP_TARGET(ATTR) static size_t NAME##_lead##KIND(const uint8_t* data, size_t size, const uint8_t* pattern, \
-                                                size_t length) { \
+FP_TARGET(ATTR) static size_t NAME##_lead##KIND(const uint8_t* data, size_t size, FP_PARAMS##CLASS) { \
     const size_t lead = WIDTH < 32 ? 32 : WIDTH; \
-    const size_t pos = NAME##_one_core##KIND(data, length + lead - 1, pattern, length); \
-    return pos != SIZE_MAX ? pos : NAME##_long(data, size, pattern, length); \
+    const size_t pos = NAME##_one_core##KIND(data, length + lead - 1, FP_ARGS##CLASS); \
+    return pos != SIZE_MAX ? pos : NAME##_long##CLASS(data, size, FP_ARGS##CLASS); \
 }
 FP_DEFINE_X86_SEARCH(fp_sse2, "sse2", __m128i, __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD,
                      _mm_and_si128, FP_SSE_EQ, FP_SSE_MATCH, FP_SSE_ANY, FP_SSE_BITS)
-#define FP_DEFINE_SSE2_EXACT(KIND, VERIFY) \
-    FP_DEFINE_X86_ONE(fp_sse2, KIND, VERIFY, "sse2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, FP_SSE_EQ, \
-                      FP_SSE_MATCH, FP_SSE_BITS, fp_exact_small) \
-    FP_DEFINE_X86_EXACT(fp_sse2, KIND, VERIFY, "sse2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, FP_SSE_MATCH, \
-                        FP_SSE_BITS)
-FP_DEFINE_SSE2_EXACT(_s, fp_verify_exact)
-FP_DEFINE_SSE2_EXACT(_w, fp_verify_exact8)
+#define FP_DEFINE_SSE2_LEAVES(KIND, CLASS, VERIFY) \
+    FP_DEFINE_X86_ONE(fp_sse2, KIND, CLASS, VERIFY, "sse2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, FP_SSE_EQ, \
+                      FP_SSE_MATCH, FP_SSE_BITS, FP_SMALL##CLASS) \
+    FP_DEFINE_X86_SMALL(fp_sse2, KIND, CLASS, VERIFY, "sse2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, \
+                        FP_SSE_MATCH, FP_SSE_BITS)
+FP_DEFINE_SSE2_LEAVES(_s, _exact, fp_verify_exact)
+FP_DEFINE_SSE2_LEAVES(_w, _exact, fp_verify_exact8)
+FP_DEFINE_SSE2_LEAVES(_ms, _mask, fp_verify_masked)
+FP_DEFINE_SSE2_LEAVES(_mw, _mask, fp_verify_masked8)
 #if defined(FP_WIDE_X86)
 #define FP_AVX_LOAD(p) _mm256_loadu_si256((const __m256i*)(const void*)(p))
 #define FP_AVX_BITS(x) ((uint64_t)(unsigned int)_mm256_movemask_epi8(x))
@@ -508,17 +583,19 @@ FP_DEFINE_X86_SEARCH(fp_avx2, "avx2", __m256i, __m256i, 32, _mm256_set1_epi8, FP
                      _mm256_and_si256, FP_AVX_EQ, FP_AVX_MATCH, FP_AVX_ANY, FP_AVX_BITS)
 /* fp_avx2x16 uses 16-byte blocks compiled for AVX2 (one-instruction
  * broadcasts, VEX encoding) for buffers shorter than 32 bytes. */
-#define FP_DEFINE_AVX2_EXACT(KIND, VERIFY) \
-    FP_DEFINE_X86_ONE(fp_avx2x16, KIND, VERIFY, "avx2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, FP_SSE_EQ, \
-                      FP_SSE_MATCH, FP_SSE_BITS, fp_exact_small) \
-    FP_DEFINE_X86_ONE(fp_avx2, KIND, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, FP_AVX_EQ, \
-                      FP_AVX_MATCH, FP_AVX_BITS, fp_avx2x16_one##KIND) \
-    FP_DEFINE_X86_TWO(fp_avx2, KIND, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, FP_AVX_MATCH, \
-                      FP_AVX_BITS) \
-    FP_DEFINE_X86_EXACT(fp_avx2, KIND, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, FP_AVX_MATCH, \
-                        FP_AVX_BITS)
-FP_DEFINE_AVX2_EXACT(_s, fp_verify_exact)
-FP_DEFINE_AVX2_EXACT(_w, fp_verify_exact8)
+#define FP_DEFINE_AVX2_LEAVES(KIND, CLASS, VERIFY) \
+    FP_DEFINE_X86_ONE(fp_avx2x16, KIND, CLASS, VERIFY, "avx2", __m128i, 16, _mm_set1_epi8, FP_SSE_LOAD, \
+                      FP_SSE_EQ, FP_SSE_MATCH, FP_SSE_BITS, FP_SMALL##CLASS) \
+    FP_DEFINE_X86_ONE(fp_avx2, KIND, CLASS, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, \
+                      FP_AVX_EQ, FP_AVX_MATCH, FP_AVX_BITS, fp_avx2x16_one##KIND) \
+    FP_DEFINE_X86_TWO(fp_avx2, KIND, CLASS, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, \
+                      FP_AVX_MATCH, FP_AVX_BITS) \
+    FP_DEFINE_X86_SMALL(fp_avx2, KIND, CLASS, VERIFY, "avx2", __m256i, 32, _mm256_set1_epi8, FP_AVX_LOAD, \
+                        FP_AVX_MATCH, FP_AVX_BITS)
+FP_DEFINE_AVX2_LEAVES(_s, _exact, fp_verify_exact)
+FP_DEFINE_AVX2_LEAVES(_w, _exact, fp_verify_exact8)
+FP_DEFINE_AVX2_LEAVES(_ms, _mask, fp_verify_masked)
+FP_DEFINE_AVX2_LEAVES(_mw, _mask, fp_verify_masked8)
 #define FP_AVX512_LOAD(p) _mm512_loadu_si512((const void*)(p))
 #define FP_AVX512_BITS(x) ((uint64_t)(x))
 #define FP_AVX512_EQ(x, y) ((uint64_t)_mm512_cmpeq_epi8_mask((x), (y)))
@@ -530,26 +607,25 @@ FP_DEFINE_X86_SEARCH(fp_avx512, "avx512f,avx512bw", __m512i, __mmask64, 64, _mm5
                      FP_AVX512_LOAD, _mm512_and_si512, FP_AVX512_EQ, FP_AVX512_MATCH,
                      FP_AVX512_ANY, FP_AVX512_BITS)
 /* AVX-512BW masked loads do not fault on masked-out lanes, so a block of up
- * to 64 exact starts loads exactly the bytes it needs, at any size: the one
- * block of fp_avx512_one and the second block of fp_avx512_two. */
-#define FP_DEFINE_AVX512_EXACT(KIND, VERIFY) \
+ * to 64 starts loads exactly the bytes it needs, at any size: the one block
+ * of fp_avx512_one and the second block of fp_avx512_two. */
+#define FP_DEFINE_AVX512_LEAVES(KIND, CLASS, VERIFY) \
 FP_TARGET_INLINE("avx512f,avx512bw") static size_t fp_avx512_one_core##KIND(const uint8_t* data, size_t size, \
-                                                                            const uint8_t* pattern, \
-                                                                            size_t length) { \
+                                                                            FP_PARAMS##CLASS) { \
     const size_t last = length - 1; \
     const __mmask64 lanes = (__mmask64)(~UINT64_C(0) >> (64 - (size - last))); \
     const __m512i x = _mm512_maskz_loadu_epi8(lanes, data), y = _mm512_maskz_loadu_epi8(lanes, data + last); \
     const __mmask64 bits = _mm512_mask_cmpeq_epi8_mask( \
         _mm512_mask_cmpeq_epi8_mask(lanes, x, _mm512_set1_epi8((char)pattern[0])), y, \
         _mm512_set1_epi8((char)pattern[last])); \
-    return VERIFY(data, 0, bits, pattern, length); \
+    return VERIFY(data, 0, bits, FP_ARGS##CLASS); \
 } \
 FP_TARGET("avx512f,avx512bw") static size_t fp_avx512_one##KIND(const uint8_t* data, size_t size, \
-                                                                const uint8_t* pattern, size_t length) { \
-    return fp_avx512_one_core##KIND(data, size, pattern, length); \
+                                                                FP_PARAMS##CLASS) { \
+    return fp_avx512_one_core##KIND(data, size, FP_ARGS##CLASS); \
 } \
 FP_TARGET("avx512f,avx512bw") static size_t fp_avx512_two##KIND(const uint8_t* data, size_t size, \
-                                                                const uint8_t* pattern, size_t length) { \
+                                                                FP_PARAMS##CLASS) { \
     const size_t last = length - 1; \
     const __mmask64 more = (__mmask64)(~UINT64_C(0) >> (128 - (size - last))); \
     const __m512i av = _mm512_set1_epi8((char)pattern[0]), bv = _mm512_set1_epi8((char)pattern[last]); \
@@ -557,13 +633,15 @@ FP_TARGET("avx512f,avx512bw") static size_t fp_avx512_two##KIND(const uint8_t* d
     const __m512i y = _mm512_maskz_loadu_epi8(more, data + 64 + last); \
     const uint64_t lo = FP_AVX512_MATCH(FP_AVX512_LOAD(data), av, FP_AVX512_LOAD(data + last), bv); \
     const uint64_t hi = _mm512_mask_cmpeq_epi8_mask(_mm512_mask_cmpeq_epi8_mask(more, x, av), y, bv); \
-    const size_t pos = VERIFY(data, 0, lo, pattern, length); \
-    return pos != SIZE_MAX ? pos : VERIFY(data, 64, hi, pattern, length); \
+    const size_t pos = VERIFY(data, 0, lo, FP_ARGS##CLASS); \
+    return pos != SIZE_MAX ? pos : VERIFY(data, 64, hi, FP_ARGS##CLASS); \
 } \
-FP_DEFINE_X86_EXACT(fp_avx512, KIND, VERIFY, "avx512f,avx512bw", __m512i, 64, _mm512_set1_epi8, FP_AVX512_LOAD, \
-                    FP_AVX512_MATCH, FP_AVX512_BITS)
-FP_DEFINE_AVX512_EXACT(_s, fp_verify_exact)
-FP_DEFINE_AVX512_EXACT(_w, fp_verify_exact8)
+FP_DEFINE_X86_SMALL(fp_avx512, KIND, CLASS, VERIFY, "avx512f,avx512bw", __m512i, 64, _mm512_set1_epi8, \
+                    FP_AVX512_LOAD, FP_AVX512_MATCH, FP_AVX512_BITS)
+FP_DEFINE_AVX512_LEAVES(_s, _exact, fp_verify_exact)
+FP_DEFINE_AVX512_LEAVES(_w, _exact, fp_verify_exact8)
+FP_DEFINE_AVX512_LEAVES(_ms, _mask, fp_verify_masked)
+FP_DEFINE_AVX512_LEAVES(_mw, _mask, fp_verify_masked8)
 #endif
 #undef FP_DEFINE_X86_SEARCH
 
@@ -596,49 +674,58 @@ FP_INLINE uint64_t fp_sse2_head(const uint8_t* data, size_t size, size_t count, 
 #endif
 
 #if defined(FP_X86)
-/* Returns from the enclosing function with the widest available exact
- * search (see FP_DEFINE_X86_EXACT); falls through when the backend has no
- * SIMD. The pattern kind and the number of starts are tested first, the
- * backend last, so whichever backend is in use reaches its leaf with one
- * taken branch. BACKEND is a local, evaluated more than once. */
+/* Returns from the enclosing function with the widest available leaf (see
+ * the leaf kinds above), passing it ARGS, a parenthesized argument list;
+ * falls through when the backend has no SIMD. The pattern kind and the
+ * number of starts are tested first, the backend last, so whichever backend
+ * is in use reaches its leaf with one taken branch. BACKEND is evaluated
+ * more than once. TAIL prefixes each return: FP_MUSTTAIL where the leaf
+ * takes the enclosing function's parameter types, else FP_NOTAIL. */
+#define FP_NOTAIL
 #if defined(FP_WIDE_X86)
-#define FP_RETURN_LEAF(backend, LEAF, data, size, pattern, length) do { \
-        if ((backend) >= FP_AVX512) return fp_avx512_##LEAF(data, size, pattern, length); \
-        if ((backend) >= FP_AVX2) return fp_avx2_##LEAF(data, size, pattern, length); \
-        if ((backend) >= FP_SSE2) return fp_sse2_##LEAF(data, size, pattern, length); \
+#define FP_RETURN_LEAF(TAIL, backend, LEAF, ARGS) do { \
+        if ((backend) >= FP_AVX512) TAIL return fp_avx512_##LEAF ARGS; \
+        if ((backend) >= FP_AVX2) TAIL return fp_avx2_##LEAF ARGS; \
+        if ((backend) >= FP_SSE2) TAIL return fp_sse2_##LEAF ARGS; \
     } while (0)
 /* Buffers shorter than 32 bytes take AVX2's 16-byte leaf directly. */
-#define FP_RETURN_ONE(backend, LEAF, data, size, pattern, length) do { \
-        if ((backend) >= FP_AVX512) return fp_avx512_##LEAF(data, size, pattern, length); \
-        if ((backend) >= FP_AVX2) return (size) < 32 ? fp_avx2x16_##LEAF(data, size, pattern, length) \
-                                                     : fp_avx2_##LEAF(data, size, pattern, length); \
-        if ((backend) >= FP_SSE2) return fp_sse2_##LEAF(data, size, pattern, length); \
+#define FP_RETURN_ONE(TAIL, backend, LEAF, size, ARGS) do { \
+        if ((backend) >= FP_AVX512) TAIL return fp_avx512_##LEAF ARGS; \
+        if ((backend) >= FP_AVX2) { \
+            if ((size) < 32) TAIL return fp_avx2x16_##LEAF ARGS; \
+            TAIL return fp_avx2_##LEAF ARGS; \
+        } \
+        if ((backend) >= FP_SSE2) TAIL return fp_sse2_##LEAF ARGS; \
     } while (0)
 /* For 65 to 128 starts, SSE2's loop beats merging eight blocks into masks. */
-#define FP_RETURN_TWO(backend, KIND, data, size, pattern, length) do { \
-        if ((backend) >= FP_AVX512) return fp_avx512_two##KIND(data, size, pattern, length); \
-        if ((backend) >= FP_AVX2) return fp_avx2_two##KIND(data, size, pattern, length); \
-        if ((backend) >= FP_SSE2) return fp_sse2_small##KIND(data, size, pattern, length); \
+#define FP_RETURN_TWO(TAIL, backend, KIND, ARGS) do { \
+        if ((backend) >= FP_AVX512) TAIL return fp_avx512_two##KIND ARGS; \
+        if ((backend) >= FP_AVX2) TAIL return fp_avx2_two##KIND ARGS; \
+        if ((backend) >= FP_SSE2) TAIL return fp_sse2_small##KIND ARGS; \
     } while (0)
 #else
-#define FP_RETURN_LEAF(backend, LEAF, data, size, pattern, length) do { \
-        if ((backend) >= FP_SSE2) return fp_sse2_##LEAF(data, size, pattern, length); \
+#define FP_RETURN_LEAF(TAIL, backend, LEAF, ARGS) do { \
+        if ((backend) >= FP_SSE2) TAIL return fp_sse2_##LEAF ARGS; \
     } while (0)
-#define FP_RETURN_ONE FP_RETURN_LEAF
-#define FP_RETURN_TWO(backend, KIND, data, size, pattern, length) do { \
-        if ((backend) >= FP_SSE2) return fp_sse2_small##KIND(data, size, pattern, length); \
-    } while (0)
+#define FP_RETURN_ONE(TAIL, backend, LEAF, size, ARGS) FP_RETURN_LEAF(TAIL, backend, LEAF, ARGS)
+#define FP_RETURN_TWO(TAIL, backend, KIND, ARGS) FP_RETURN_LEAF(TAIL, backend, small##KIND, ARGS)
 #endif
-#define FP_RETURN_EXACT_KIND(backend, KIND, data, size, pattern, length) do { \
+#define FP_RETURN_KIND(TAIL, backend, KIND, size, length, ARGS) do { \
         const size_t fp_starts = (size) - (length); \
-        if (fp_starts < 64) FP_RETURN_ONE(backend, one##KIND, data, size, pattern, length); \
-        else if (fp_starts < 128) FP_RETURN_TWO(backend, KIND, data, size, pattern, length); \
-        else if (fp_starts < 1024) FP_RETURN_LEAF(backend, small##KIND, data, size, pattern, length); \
-        else FP_RETURN_LEAF(backend, lead##KIND, data, size, pattern, length); \
+        if (fp_starts < 64) FP_RETURN_ONE(TAIL, backend, one##KIND, size, ARGS); \
+        else if (fp_starts < 128) FP_RETURN_TWO(TAIL, backend, KIND, ARGS); \
+        else if (fp_starts < 1024) FP_RETURN_LEAF(TAIL, backend, small##KIND, ARGS); \
+        else FP_RETURN_LEAF(TAIL, backend, lead##KIND, ARGS); \
     } while (0)
 #define FP_RETURN_EXACT(backend, data, size, pattern, length) do { \
-        if ((length) - 8 <= 8) FP_RETURN_EXACT_KIND(backend, _w, data, size, pattern, length); \
-        else FP_RETURN_EXACT_KIND(backend, _s, data, size, pattern, length); \
+        if ((length) - 8 <= 8) FP_RETURN_KIND(FP_NOTAIL, backend, _w, size, length, (data, size, pattern, length)); \
+        else FP_RETURN_KIND(FP_NOTAIL, backend, _s, size, length, (data, size, pattern, length)); \
+    } while (0)
+/* A masked pattern whose first and last bytes are exact. */
+#define FP_RETURN_MASKED(TAIL, backend, data, size, pattern, length, mask) do { \
+        if ((length) - 8 <= 8) \
+            FP_RETURN_KIND(TAIL, backend, _mw, size, length, (data, size, pattern, length, mask)); \
+        else FP_RETURN_KIND(TAIL, backend, _ms, size, length, (data, size, pattern, length, mask)); \
     } while (0)
 #endif
 
@@ -737,6 +824,14 @@ FP_INLINE size_t fp_search(const uint8_t* data, size_t size, const fp_plan* plan
         const int backend = fp_get_backend();
         FP_RETURN_EXACT(backend, data, size, plan->bytes, plan->length);
     }
+    if (plan->anchored) {
+        /* Wherever the pattern starts in data, its bytes from first to last
+         * start at the same offset in data + first. */
+        const int backend = fp_get_backend();
+        const size_t first = plan->first, length = plan->last - first + 1;
+        FP_RETURN_MASKED(FP_NOTAIL, backend, data + first, size - (plan->length - length), plan->bytes + first,
+                         length, plan->mask + first);
+    }
 #endif
     if (count == 1) return fp_matches(data, plan) ? 0 : SIZE_MAX;
     if (!plan->mask && plan->length == 1) {
@@ -779,6 +874,16 @@ FP_NOINLINE size_t fp_find_planned(const uint8_t* data, size_t data_size,
 FP_NOINLINE size_t fp_exact_planned(const uint8_t* data, size_t size, const uint8_t* pattern, size_t length) {
     return fp_find_planned(data, size, pattern, length, NULL);
 }
+
+/* Masked searches from fp_find whose first and last bytes are exact. Kept
+ * out of fp_find, whose exact paths then save no registers; each backend
+ * test reads the cached value afresh, a memory operand, for the same
+ * reason. */
+FP_NOINLINE size_t fp_find_masked(const uint8_t* data, size_t size, const uint8_t* pattern, size_t length,
+                                  const uint8_t* mask) {
+    FP_RETURN_MASKED(FP_MUSTTAIL, fp_known_backend(), data, size, pattern, length, mask);
+    FP_MUSTTAIL return fp_find_planned(data, size, pattern, length, mask);
+}
 #endif
 
 size_t fp_find(const uint8_t* data, size_t data_size,
@@ -787,15 +892,19 @@ size_t fp_find(const uint8_t* data, size_t data_size,
     if (!data || !pattern || !pattern_size || data_size < pattern_size) return SIZE_MAX;
 #if defined(FP_X86)
     /* Exact searches skip planning and make a single call to the widest
-     * available implementation, which also handles short buffers. Until the
-     * backend is known, they take the planned path, which detects it. */
+     * available implementation, which also handles short buffers, and so do
+     * masked ones whose first and last bytes are exact (fp_find_masked).
+     * Until the backend is known, they take the planned path, which detects
+     * it. */
     if (!mask) {
         const int backend = fp_known_backend();
         FP_RETURN_EXACT(backend, data, data_size, pattern, pattern_size);
         return fp_exact_planned(data, data_size, pattern, pattern_size);
     }
+    if ((mask[0] & mask[pattern_size - 1]) == 0xff)
+        FP_MUSTTAIL return fp_find_masked(data, data_size, pattern, pattern_size, mask);
 #endif
-    return fp_find_planned(data, data_size, pattern, pattern_size, mask);
+    FP_MUSTTAIL return fp_find_planned(data, data_size, pattern, pattern_size, mask);
 }
 
 static int fp_space(unsigned char c) {
@@ -853,9 +962,41 @@ fp_pattern* fp_compile(const char* pattern_str) {
     return pattern;
 }
 
+/* Searches with compiled patterns that fp_find_compiled does not dispatch
+ * itself, including those before the backend is known. */
+FP_NOINLINE size_t fp_search_compiled(const uint8_t* data, size_t size, const fp_plan* plan) {
+    return fp_search(data, size, plan);
+}
+
+#if defined(FP_X86)
+/* The anchored case of fp_search for compiled patterns, kept out of
+ * fp_find_compiled, which then needs no frame for the leaf's mask
+ * argument. */
+FP_NOINLINE size_t fp_compiled_masked(const uint8_t* data, size_t size, const fp_plan* plan) {
+    const int backend = fp_known_backend();
+    const size_t first = plan->first, length = plan->last - first + 1;
+    FP_RETURN_MASKED(FP_NOTAIL, backend, data + first, size - (plan->length - length), plan->bytes + first,
+                     length, plan->mask + first);
+    return fp_search_compiled(data, size, plan);
+}
+#endif
+
 size_t fp_find_compiled(const uint8_t* data, size_t data_size, const fp_pattern* pattern) {
+    const fp_plan* plan;
     if (!data || !pattern || data_size < pattern->plan.length) return SIZE_MAX;
-    return fp_search(data, data_size, &pattern->plan);
+    plan = &pattern->plan;
+#if defined(FP_X86)
+    /* Exact and anchored patterns dispatch like those of fp_find. */
+    if (!plan->mask) {
+        const int backend = fp_known_backend();
+        FP_RETURN_EXACT(backend, data, data_size, plan->bytes, plan->length);
+    } else if (plan->anchored) {
+        return fp_compiled_masked(data, data_size, plan);
+    } else if (plan->wildcard_only) {
+        return 0;
+    }
+#endif
+    return fp_search_compiled(data, data_size, plan);
 }
 
 void fp_free(fp_pattern* pattern) { free(pattern); }

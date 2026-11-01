@@ -309,6 +309,113 @@ static void test_long_exact(void)
     }
 }
 
+/* Writes a pattern with masks of 0, 0x0f, 0xf0, or 0xff as parser text. */
+static void format_pattern(char *text, const uint8_t *pattern, const uint8_t *mask, size_t m)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i, written = 0;
+    for (i = 0; i < m; ++i) {
+        text[written++] = mask[i] & 0xf0 ? hex[pattern[i] >> 4] : '?';
+        text[written++] = mask[i] & 0x0f ? hex[pattern[i] & 15] : '?';
+        text[written++] = ' ';
+    }
+    text[written] = '\0';
+}
+
+static void test_masked_ends(void)
+{
+    /* Masked patterns whose first and last constrained bytes are exact are
+     * searched like exact ones; compiled patterns trim wildcard ends first.
+     * Walk matches through buffers around each size class (64, 128, and 1024
+     * starts), in a flood of the anchor byte and in sparse data. Layouts:
+     * a nibble and a wildcard inside, leading wildcards, trailing wildcards,
+     * and wildcards between the first byte and the distinguishing one (none
+     * for 3 bytes, so the mask is all 0xff). */
+    static const size_t sizes[] = {
+        8, 15, 16, 17, 23, 24, 31, 32, 33, 47, 63, 64, 65, 71, 72, 79, 80, 95, 96, 127, 128, 129,
+        135, 136, 143, 191, 192, 255, 256, 1030, 1031, 1032, 1100
+    };
+    static const size_t pattern_sizes[] = {2, 3, 4, 8, 9, 12, 15, 16, 17, 24, 33};
+    static uint8_t data[1100];
+    uint8_t pattern[33];
+    uint8_t mask[33];
+    char text[3 * 33 + 1];
+    size_t a, b, layout, background, location, l, j;
+    for (a = 0; a < sizeof(sizes) / sizeof(sizes[0]); ++a) {
+        const size_t n = sizes[a];
+        for (b = 0; b < sizeof(pattern_sizes) / sizeof(pattern_sizes[0]); ++b) {
+            const size_t m = pattern_sizes[b];
+            if (m > n) {
+                continue;
+            }
+            for (layout = 0; layout < 4; ++layout) {
+                fp_pattern *compiled;
+                memset(pattern, 0xa5, m);
+                pattern[m / 2] = 0x5a;
+                memset(mask, 0xff, m);
+                switch (layout) {
+                case 0:
+                    if (m < 4) {
+                        continue;
+                    }
+                    mask[1] = 0x0f;
+                    mask[m - 2] = 0;
+                    break;
+                case 1:
+                    mask[0] = 0;
+                    if (m > 3) {
+                        mask[1] = 0;
+                    }
+                    break;
+                case 2:
+                    mask[m - 1] = 0;
+                    if (m > 3) {
+                        mask[m - 2] = 0;
+                    }
+                    break;
+                default:
+                    for (j = 1; j < m / 2; ++j) {
+                        mask[j] = 0;
+                    }
+                    break;
+                }
+                format_pattern(text, pattern, mask, m);
+                compiled = fp_compile(text);
+                CHECK_EQ(compiled != NULL, 1);
+                for (background = 0; background < 2; ++background) {
+                    const uint8_t fill = background ? 0x11 : 0xa5;
+                    const size_t locations[] = {0, 1, 31, 32, 63, 64, 65, 127, 128, 129, n / 2, n - m - 1, n - m};
+                    const size_t walked = n > 300 ? sizeof(locations) / sizeof(locations[0]) : n - m + 1;
+                    size_t expected;
+                    memset(data, fill, n);
+                    expected = reference_find(data, n, pattern, m, mask);
+                    CHECK_EQ(fp_find(data, n, pattern, m, mask), expected);
+                    CHECK_EQ(fp_find_compiled(data, n, compiled), expected);
+                    for (l = 0; l < walked; ++l) {
+                        location = n > 300 ? locations[l] : l;
+                        memset(data, fill, n);
+                        for (j = 0; j < m; ++j) {
+                            /* Unconstrained bits differ from the pattern's. */
+                            data[location + j] = (uint8_t)((pattern[j] & mask[j]) | (0x3c & (uint8_t)~mask[j]));
+                        }
+                        expected = reference_find(data, n, pattern, m, mask);
+                        CHECK_EQ(fp_find(data, n, pattern, m, mask), expected);
+                        CHECK_EQ(fp_find_compiled(data, n, compiled), expected);
+                    }
+                    /* A copy cut short by the buffer end, by a trailing
+                     * wildcard in layout 2, does not fit. */
+                    memset(data, fill, n);
+                    memcpy(data + n - m + 1, pattern, m - 1);
+                    expected = reference_find(data, n, pattern, m, mask);
+                    CHECK_EQ(fp_find(data, n, pattern, m, mask), expected);
+                    CHECK_EQ(fp_find_compiled(data, n, compiled), expected);
+                }
+                fp_free(compiled);
+            }
+        }
+    }
+}
+
 /* Random patterns, masks, and buffers of up to max_size bytes; a nonzero
  * alphabet draws data and pattern bytes from that many values, giving dense
  * candidates and repeated matches. */
@@ -448,6 +555,7 @@ static void test_guard_pages(void)
 {
     static const size_t sizes[] = {1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
                                    1100, 2049, 4096};
+    static char pattern_text[3 * 4096 + 1];
     guarded_page data_region = allocate_guarded_page();
     guarded_page pattern_region = allocate_guarded_page();
     guarded_page mask_region = allocate_guarded_page();
@@ -469,6 +577,18 @@ static void test_guard_pages(void)
                 memcpy(data + n - m, pattern, m);
                 CHECK_EQ(fp_find(data, n, pattern, m, NULL), n - m);
                 CHECK_EQ(fp_find(data, n, pattern, m, mask), n - m);
+                if (m >= 3) {
+                    fp_pattern *compiled;
+                    mask[m / 2] = 0;
+                    CHECK_EQ(fp_find(data, n, pattern, m, mask), n - m);
+                    mask[m - 1] = 0;
+                    CHECK_EQ(fp_find(data, n, pattern, m, mask), reference_find(data, n, pattern, m, mask));
+                    format_pattern(pattern_text, pattern, mask, m);
+                    compiled = fp_compile(pattern_text);
+                    CHECK_EQ(compiled != NULL, 1);
+                    CHECK_EQ(fp_find_compiled(data, n, compiled), reference_find(data, n, pattern, m, mask));
+                    fp_free(compiled);
+                }
                 memset(mask, 0, m);
                 mask[m / 2] = 0xff;
                 CHECK_EQ(fp_find(data, n, pattern, m, mask), reference_find(data, n, pattern, m, mask));
@@ -507,6 +627,7 @@ int main(void)
     test_boundaries();
     test_dense_candidates();
     test_long_exact();
+    test_masked_ends();
     test_random();
     test_random_parser();
     test_guard_pages();
